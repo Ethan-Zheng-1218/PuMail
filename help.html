@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>用户手册 · PuMail</title>
+    <script>if (localStorage.getItem('pupu_theme') === 'light') document.documentElement.classList.add('theme-light');</script>
+    <link rel="stylesheet" href="styles.css?v=124" />
+  </head>
+  <body class="privacy-body">
+    <main class="privacy-wrap help-wrap">
+      <header class="help-hero">
+        <p class="help-kicker">用户手册</p>
+        <h1>PuMail</h1>
+        <p class="privacy-sub">Less is more</p>
+      </header>
+
+      <article class="help-doc">
+        <section class="help-section">
+          <h2><span class="help-num">一</span>快速开始</h2>
+          <dl class="help-dl">
+            <div>
+              <dt>添加入口</dt>
+              <dd>进入「设置 → 账号」页面，点击“添加邮箱账号”。</dd>
+            </div>
+            <div>
+              <dt>数量上限</dt>
+              <dd>最多支持绑定 6 个邮箱账号。</dd>
+            </div>
+            <div>
+              <dt>邮箱授权</dt>
+              <dd>QQ / Google 等需开通 IMAP 授权码，<a class="help-link" href="guide.html">见操作指南</a>。</dd>
+            </div>
+            <div>
+              <dt>退出账号</dt>
+              <dd>可选择是否保留本地邮件数据。</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="help-section">
+          <h2><span class="help-num">二</span>账号管理</h2>
+          <dl class="help-dl">
+            <div>
+              <dt>列表展示</dt>
+              <dd>显示邮箱图标、自定义名称及邮箱地址。</dd>
+            </div>
+            <div>
+              <dt>排序与显示</dt>
+              <dd>通过拖拽调整账号顺序；主界面左下角优先显示排序靠前的前 3 个邮箱。</dd>
+            </div>
+            <div>
+              <dt>密码管理</dt>
+              <dd>
+                首次绑定时需设置 6 位主密码，用于本地加密保存各邮箱的授权码、应用密码及翻译 API 密钥。数据仅存储于本机，不会外泄。
+                若忘记主密码，需删除本地加密文件后方可重新使用该功能。
+              </dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="help-section">
+          <h2><span class="help-num">三</span>主界面</h2>
+          <div class="help-cols">
+            <div class="help-col">
+              <h3>左栏 · 导航与账号</h3>
+              <ul>
+                <li><strong>顶部</strong>：写邮件按钮、基础文件夹（收件箱、已发送、星标、草稿、垃圾邮件、已删除）。</li>
+                <li><strong>中部</strong>：Gaia·总览按钮，用于总览当前登录的所有邮箱的收件箱、已发送和草稿，方便快速收取新邮件。</li>
+                <li><strong>下部</strong>：已绑定邮箱列表（仅显示排序前 3 个），底部为“设置”入口。</li>
+              </ul>
+            </div>
+            <div class="help-col">
+              <h3>中栏 · 邮件列表</h3>
+              <ul>
+                <li><strong>顶部</strong>：支持刷新当前邮箱，以获取最新邮件；支持搜索邮件。</li>
+                <li><strong>列表</strong>：支持右键邮件进行星标、置顶和删除操作；支持同时选中多个邮件。</li>
+              </ul>
+            </div>
+            <div class="help-col">
+              <h3>右栏 · 正文区</h3>
+              <ul>
+                <li>支持对邮件进行星标、置顶和删除。</li>
+                <li><strong>回复</strong>：默认选择当前发件人，可手动更改收件人。</li>
+                <li><strong>灯泡</strong>：配置翻译 API 后，支持一键切换原文 / 翻译。</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+
+        <section class="help-section">
+          <h2><span class="help-num">四</span>其他设置</h2>
+          <dl class="help-dl">
+            <div>
+              <dt>外观</dt>
+              <dd>支持深色主题（极简黑 + 青绿）与浅色主题（极简白 + 灰蓝）。</dd>
+            </div>
+            <div>
+              <dt>翻译</dt>
+              <dd>支持接入 DeepSeek / OpenAI / 自定义大模型 API。配置完成后，主界面右上角灯泡按钮启用，可一键切换原文 / 翻译；目标语言默认为简体中文。</dd>
+            </div>
+            <div>
+              <dt>存储</dt>
+              <dd>展示应用安装位置与数据存储位置，支持更改路径与打开路径，邮件本地数据依此路径保存。</dd>
+            </div>
+            <div>
+              <dt>关于</dt>
+              <dd>显示版本信息，提供用户手册入口，可查看隐私协议并进行意见反馈。</dd>
+            </div>
+          </dl>
+        </section>
+      </article>
+    </main>
+  </body>
+</html>

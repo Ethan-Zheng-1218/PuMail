@@ -1,0 +1,22 @@
+# 统一换行符：文本文件自动规范化
+* text=auto
+
+# 明确标记文本类型
+*.py text diff=python
+*.js text
+*.html text
+*.css text
+*.json text
+*.svg text
+*.md text
+*.bat text eol=crlf
+*.nsh text eol=crlf
+*.spec text
+
+# 明确标记二进制类型
+*.png binary
+*.jpg binary
+*.ico binary
+*.mp3 binary
+*.exe binary
+*.bmp binary

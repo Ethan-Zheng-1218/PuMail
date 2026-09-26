@@ -1,0 +1,67 @@
+{
+  "name": "pumail",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PuMail desktop shell",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --win nsis",
+    "pack:dir": "electron-builder --win dir"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "app.pumail.desktop",
+    "productName": "PuMail",
+    "directories": {
+      "output": "../../PuMail-build"
+    },
+    "files": [
+      "main.js",
+      "preload.js"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist/PuMail",
+        "to": "pumail-server",
+        "filter": [
+          "**/*",
+          "!**/*.db",
+          "!**/*.db-wal",
+          "!**/*.db-shm",
+          "!**/*.secret",
+          "!**/*.vault",
+          "!**/imap-debug.log"
+        ]
+      },
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": "nsis",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": false,
+      "shortcutName": "PuMail",
+      "artifactName": "PuMail-Setup.exe",
+      "include": "build/installer.nsh",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerSidebar": "build/sidebar.bmp",
+      "uninstallerSidebar": "build/sidebar.bmp",
+      "installerHeader": "build/header.bmp"
+    }
+  },
+  "allowScripts": {}
+}

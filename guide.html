@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>邮箱绑定操作指南 · PuMail</title>
+    <script>if (localStorage.getItem('pupu_theme') === 'light') document.documentElement.classList.add('theme-light');</script>
+    <link rel="stylesheet" href="styles.css?v=124" />
+  </head>
+  <body class="privacy-body">
+    <main class="privacy-wrap help-wrap guide-wrap">
+      <header class="help-hero">
+        <a class="privacy-back" href="help.html">← 返回用户手册</a>
+        <p class="help-kicker">操作指南</p>
+      </header>
+      <article class="privacy-card guide-md" id="guideBody">
+        <p class="guide-loading">正在载入指南…</p>
+      </article>
+    </main>
+    <script>
+      const TOC_IDS = {
+        '一、绑定 Gmail 邮箱': 'cpAii',
+        '二、绑定 Outlook 邮箱': 'YsOcg',
+        '三、绑定 QQ 邮箱': 'fN33Y',
+        '四、绑定 163 邮箱': 'pBQrF',
+        '五、绑定 iCloud 邮箱': 'yX2Sh',
+      };
+
+      function escapeHtml(s) {
+        return String(s)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+      }
+
+      function mdInline(raw) {
+        let s = String(raw || '');
+        const bits = [];
+        s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, alt, src) => {
+          const i = bits.length;
+          bits.push(`<img src="${src}" alt="${escapeHtml(alt)}" loading="lazy" />`);
+          return `\u0000IMG${i}\u0000`;
+        });
+        s = s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, text, href) => {
+          const i = bits.length;
+          const ext = /^https?:/i.test(href);
+          const extra = ext ? ' target="_blank" rel="noopener"' : '';
+          const label = escapeHtml(text).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+          bits.push(`<a href="${href}"${extra}>${label}</a>`);
+          return `\u0000LNK${i}\u0000`;
+        });
+        s = escapeHtml(s);
+        s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+        s = s.replace(/\u0000(?:IMG|LNK)(\d+)\u0000/g, (_, i) => bits[Number(i)]);
+        return s;
+      }
+
+      function renderMarkdown(src) {
+        const text = String(src || '').replace(/\r\n/g, '\n').replace(/<!--[\s\S]*?-->/g, '');
+        const lines = text.split('\n');
+        const out = [];
+        let i = 0;
+        let para = [];
+        let list = null;
+
+        const flushPara = () => {
+          if (!para.length) return;
+          out.push('<p>' + mdInline(para.join(' ')) + '</p>');
+          para = [];
+        };
+        const flushList = () => {
+          if (!list) return;
+          out.push('<' + list.tag + '>' + list.items.join('') + '</' + list.tag + '>');
+          list = null;
+        };
+        const flush = () => { flushPara(); flushList(); };
+
+        while (i < lines.length) {
+          const line = lines[i];
+          const trimmed = line.trim();
+          if (!trimmed) {
+            flush();
+            i += 1;
+            continue;
+          }
+          const heading = /^(#{1,3})\s+(.+)$/.exec(trimmed);
+          if (heading) {
+            flush();
+            const level = heading[1].length;
+            let rawTitle = heading[2];
+            let id = '';
+            const custom = rawTitle.match(/\s*\{#([A-Za-z0-9_-]+)\}\s*$/);
+            if (custom) {
+              id = custom[1];
+              rawTitle = rawTitle.slice(0, custom.index);
+            }
+            const title = rawTitle.replace(/\*\*/g, '').trim();
+            id = id || TOC_IDS[title] || '';
+            const idAttr = id ? ` id="${id}"` : '';
+            out.push(`<h${level}${idAttr}>` + mdInline(rawTitle) + `</h${level}>`);
+            i += 1;
+            continue;
+          }
+          if (/^[-+]\s+/.test(trimmed)) {
+            flushPara();
+            if (!list) list = { tag: 'ul', items: [] };
+            list.items.push('<li>' + mdInline(trimmed.replace(/^[-+]\s+/, '')) + '</li>');
+            i += 1;
+            continue;
+          }
+          if (/^\d+\.\s+/.test(trimmed)) {
+            flushPara();
+            if (!list || list.tag !== 'ol') {
+              flushList();
+              list = { tag: 'ol', items: [] };
+            }
+            list.items.push('<li>' + mdInline(trimmed.replace(/^\d+\.\s+/, '')) + '</li>');
+            i += 1;
+            continue;
+          }
+          flushList();
+          para.push(trimmed);
+          i += 1;
+        }
+        flush();
+        return out.join('\n');
+      }
+
+      (async () => {
+        const box = document.getElementById('guideBody');
+        try {
+          let md = window.__GUIDE_MD__;
+          if (!md) {
+            const r = await fetch(encodeURI('邮箱绑定指南.md'), { credentials: 'same-origin' });
+            if (!r.ok) throw new Error('not found');
+            md = await r.text();
+          }
+          box.innerHTML = renderMarkdown(md);
+        } catch (err) {
+          box.innerHTML = '<p>未能载入操作指南，请确认 <code>邮箱绑定指南.md</code> 与应用在同一目录。</p>';
+        }
+      })();
+    </script>
+  </body>
+</html>

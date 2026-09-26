@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=0.3, viewport-fit=cover" />
+    <title>PuMail</title>
+    <script>
+      if (localStorage.getItem('pupu_theme') === 'light') document.documentElement.classList.add('theme-light');
+      document.documentElement.classList.add('booting');
+    </script>
+    <link rel="stylesheet" href="styles.css?v=125" />
+    <style>
+      html.booting, html.booting body { min-width: 0 !important; }
+      body.booting .app { visibility: hidden; }
+      .boot-splash {
+        position: fixed; inset: 0; z-index: 400;
+        display: grid; place-items: center;
+        background: #fff;
+      }
+      html.theme-light .boot-splash { background: #fff; }
+      .boot-splash[hidden] { display: none !important; }
+    </style>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Noto+Sans+SC:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body class="booting">
+    <div class="boot-splash" id="bootSplash" role="img" aria-label="PuMail">
+      <img class="boot-cat-img" id="bootCat" src="carton1.svg" alt="" />
+    </div>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="logo" aria-hidden="true"><img src="pumail-logo.svg?v=2" alt="" /></span>
+          <div>
+            <strong>PuMail</strong>
+            <p>Less is more.</p>
+          </div>
+        </div>
+        <button class="compose-btn" id="composeBtn" type="button">写邮件</button>
+        <nav class="folders" id="folders"></nav>
+        <div class="sidebar-foot">
+          <button type="button" class="acc-rail-item gaia-btn" id="gaiaBtn" title="Gaia · 总览">
+            <span class="avatar gaia-avatar" aria-hidden="true">
+              <img src="gaia-tree.png" alt="" />
+            </span>
+            <span class="acc-rail-meta">
+              <strong>Gaia · 总览</strong>
+            </span>
+          </button>
+          <div class="acc-rail" id="accRail"></div>
+          <button type="button" class="settings-btn" id="settingsBtn" title="设置" aria-label="设置">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H8.6a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V8.6a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>
+            </svg>
+            <span>设置</span>
+          </button>
+        </div>
+      </aside>
+
+      <section class="list-pane" id="listPane">
+        <header class="list-header">
+          <div class="list-head-row">
+            <div class="list-title-wrap">
+              <h1 id="folderTitle">收件箱</h1>
+            </div>
+            <div class="list-head-actions">
+              <div class="batch-bar" id="batchBar" hidden>
+                <button type="button" id="purgeBtn" hidden title="粉碎" aria-label="粉碎">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zm2.46-7.12 1.41-1.41L12 12.59l2.12-2.12 1.41 1.41L13.41 14l2.12 2.12-1.41 1.41L12 15.41l-2.12 2.12-1.41-1.41L10.59 14l-2.13-2.12zM15.5 4l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                </button>
+                <button type="button" id="restoreBtn" hidden title="恢复" aria-label="恢复">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/></svg>
+                </button>
+              </div>
+              <button type="button" class="refresh-btn" id="refreshBtn" title="刷新" aria-label="刷新">
+                <img src="carton4.svg?v=2" alt="" />
+              </button>
+            </div>
+          </div>
+          <label class="search" id="searchWrap">
+            <input id="searchInput" type="search" name="pumail-mail-search" placeholder="搜索邮件…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" readonly />
+          </label>
+        </header>
+        <div class="mail-list" id="mailList"></div>
+        <div class="list-loading" id="listLoading" hidden>正在加载更早的邮件…</div>
+      </section>
+
+      <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" aria-label="调节列表与阅读区宽度"></div>
+
+      <section class="reading-pane" id="readingPane">
+        <div class="empty-read" id="emptyRead">
+          <div class="empty-card">
+            <div class="empty-envelope" aria-hidden="true">
+              <svg viewBox="0 0 48 48" width="53" height="53" fill="none">
+                <rect x="6" y="12" width="36" height="24" rx="4" stroke="currentColor" stroke-width="1.8"/>
+                <path d="M8 14.5 24 26 40 14.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </div>
+            <div class="empty-copy">
+              <h2>选择一封邮件</h2>
+              <p class="empty-en">Select an Email</p>
+            </div>
+          </div>
+        </div>
+        <article class="message" id="messageView" hidden>
+          <header class="message-header">
+            <div class="msg-title-row">
+              <h2 id="msgSubject"></h2>
+              <div class="message-actions">
+                <button type="button" class="lamp-toggle" id="trLamp" aria-pressed="false" title="翻译" aria-label="翻译">
+                  <svg class="lamp-bulb" viewBox="0 0 24 24" width="12" height="12" aria-hidden="true">
+                    <path d="M9 18h6M10 21h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                    <path d="M12 3a6 6 0 0 0-3.2 11c.5.4.8 1 .8 1.6V17h5v-1.4c0-.6.3-1.2.8-1.6A6 6 0 0 0 12 3z" fill="currentColor"/>
+                  </svg>
+                  <span class="lamp-track" aria-hidden="true"><span class="lamp-knob"></span></span>
+                </button>
+                <button type="button" id="starBtn">星标</button>
+                <button type="button" id="pinBtn">置顶</button>
+                <button type="button" id="replyBtn">回复</button>
+                <button type="button" id="deleteBtn">删除</button>
+              </div>
+            </div>
+            <div class="msg-meta-row">
+              <div class="msg-parties" id="msgParties"></div>
+              <div class="msg-side">
+                <time id="msgDate"></time>
+              </div>
+            </div>
+          </header>
+          <div class="message-scroll">
+            <div id="threadView"></div>
+            <div class="reply-thread" id="replyThread">
+              <div id="replySentList"></div>
+              <div class="reply-composer" id="replyComposer" hidden>
+                <button type="button" class="icon-close" id="closeReplyBtn" aria-label="关闭">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                </button>
+                <div class="reply-addrs">
+                  <div class="reply-people" id="replyPeople" hidden></div>
+                  <div class="reply-to-row">
+                    <label class="reply-field">收件人
+                      <span class="reply-input-wrap addr-edit" data-addr-for="replyToInput">
+                        <span class="addr-tokens"></span>
+                        <input id="replyToInput" type="text" autocomplete="off" spellcheck="false" placeholder="点上方选择，或输入新邮箱" />
+                        <ul class="email-suggest" id="replyToSuggest" hidden></ul>
+                      </span>
+                    </label>
+                    <button type="button" class="reply-cc-plus" id="replyCcBtn" title="抄送 / 密送" aria-label="显示抄送和密送" aria-expanded="false">
+                      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                    </button>
+                  </div>
+                  <div class="reply-cc-box" id="replyCcBox">
+                    <label class="reply-field">抄送
+                      <span class="reply-input-wrap addr-edit" data-addr-for="replyCcInput">
+                        <span class="addr-tokens"></span>
+                        <input id="replyCcInput" type="text" autocomplete="off" spellcheck="false" placeholder="可选" />
+                        <ul class="email-suggest" id="replyCcSuggest" hidden></ul>
+                      </span>
+                    </label>
+                    <label class="reply-field">密送
+                      <span class="reply-input-wrap addr-edit" data-addr-for="replyBccInput">
+                        <span class="addr-tokens"></span>
+                        <input id="replyBccInput" type="text" autocomplete="off" spellcheck="false" placeholder="可选" />
+                        <ul class="email-suggest" id="replyBccSuggest" hidden></ul>
+                      </span>
+                    </label>
+                  </div>
+                </div>
+                <textarea id="replyBody" rows="4" placeholder="写下回复…"></textarea>
+                <footer>
+                  <button type="button" class="ghost" id="cancelReplyBtn">取消</button>
+                  <button type="button" id="sendReplyBtn">发送</button>
+                </footer>
+              </div>
+            </div>
+          </div>
+        </article>
+      </section>
+    </div>
+
+    <div class="overlay" id="overlay" hidden>
+      <form class="compose compose-mail" id="composeForm">
+        <header>
+          <h2 id="composeTitle">新邮件</h2>
+          <button type="button" class="icon-close" id="closeCompose" aria-label="关闭">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </header>
+        <div class="compose-scenes" id="composeScenes" hidden>
+          <span class="compose-scenes-label">场景</span>
+          <div class="compose-scenes-picks" id="composeScenePicks"></div>
+        </div>
+        <div class="cc-cluster" id="ccCluster">
+          <div class="compose-to-row">
+            <label class="compose-field">收件人
+              <span class="addr-edit" data-addr-for="toInput">
+                <span class="addr-tokens"></span>
+                <input id="toInput" type="text" autocomplete="off" spellcheck="false" placeholder="name@example.com" />
+                <ul class="email-suggest" id="toSuggest" hidden></ul>
+              </span>
+            </label>
+            <button type="button" class="cc-plus" id="toggleCcBtn" title="抄送 / 密送" aria-label="显示抄送和密送" aria-expanded="false">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+          </div>
+          <div class="cc-bcc-box" id="ccBccBox">
+            <label>抄送
+              <span class="addr-edit" data-addr-for="ccInput">
+                <span class="addr-tokens"></span>
+                <input id="ccInput" type="text" autocomplete="off" spellcheck="false" placeholder="可选" />
+                <ul class="email-suggest" id="ccSuggest" hidden></ul>
+              </span>
+            </label>
+            <label>密送
+              <span class="addr-edit" data-addr-for="bccInput">
+                <span class="addr-tokens"></span>
+                <input id="bccInput" type="text" autocomplete="off" spellcheck="false" placeholder="可选" />
+                <ul class="email-suggest" id="bccSuggest" hidden></ul>
+              </span>
+            </label>
+          </div>
+        </div>
+        <label>主题<input id="subjectInput" type="text" placeholder="这封信想说什么" /></label>
+        <div class="compose-body-label">
+          <span>正文</span>
+          <div class="compose-toolbar">
+            <button type="button" id="fmtBold" title="加粗" aria-label="加粗"><b>B</b></button>
+            <button type="button" id="fmtItalic" title="斜体" aria-label="斜体"><i>I</i></button>
+          </div>
+          <div id="bodyInput" class="compose-editor" contenteditable="true" data-placeholder="写点什么…" role="textbox" aria-multiline="true"></div>
+        </div>
+        <label class="compose-attach">附件<input id="attachInput" type="file" multiple /></label>
+        <footer>
+          <button type="button" class="ghost" id="saveDraftBtn">存草稿</button>
+          <button type="submit">发送</button>
+        </footer>
+      </form>
+    </div>
+
+    <div class="overlay settings-overlay" id="settingsOverlay" hidden>
+      <div class="settings-panel" role="dialog" aria-labelledby="settingsTitle">
+        <header class="settings-head">
+          <h2 id="settingsTitle">设置</h2>
+          <button type="button" class="icon-close" id="closeSettings" aria-label="关闭">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </header>
+        <div class="settings-body">
+          <nav class="settings-nav" id="settingsNav">
+            <button type="button" class="settings-nav-btn active" data-pane="account">账号</button>
+            <button type="button" class="settings-nav-btn" data-pane="general">通用</button>
+            <button type="button" class="settings-nav-btn" data-pane="appearance">外观</button>
+            <button type="button" class="settings-nav-btn" data-pane="translate">翻译</button>
+            <button type="button" class="settings-nav-btn" data-pane="privacy">存储</button>
+            <button type="button" class="settings-nav-btn" data-pane="about">关于</button>
+          </nav>
+          <div class="settings-content">
+            <section class="settings-pane" id="pane-general" hidden>
+              <h3>通用</h3>
+              <div class="settings-card">
+                <div class="toggle-row">
+                  <span class="toggle-label">开机自动启动</span>
+                  <label class="toggle-switch">
+                    <input type="checkbox" id="autoStartToggle" />
+                    <span class="toggle-slider"></span>
+                  </label>
+                </div>
+                <div class="toggle-row">
+                  <span class="toggle-label">开启提示音</span>
+                  <label class="toggle-switch">
+                    <input type="checkbox" id="noticeSoundToggle" />
+                    <span class="toggle-slider"></span>
+                  </label>
+                </div>
+              </div>
+            </section>
+            <section class="settings-pane" id="pane-account" hidden>
+              <div class="settings-pane-head">
+                <div>
+                  <h3>账号</h3>
+                  <p class="settings-lead">最多支持绑定6个邮箱账号</p>
+                </div>
+                <div class="settings-pane-actions">
+                  <button type="button" class="ghost" id="vaultBtn">密码管理</button>
+                  <button type="button" id="addAccBtn">添加邮箱账号</button>
+                </div>
+              </div>
+              <div class="settings-acc-list" id="settingsAccList"></div>
+            </section>
+            <section class="settings-pane" id="pane-appearance" hidden>
+              <h3>外观</h3>
+              <p class="settings-lead">选择界面主题。</p>
+              <div class="theme-picks" id="themePicks">
+                <button type="button" class="theme-pick" data-theme="dark">
+                  <span class="theme-swatch theme-swatch-dark" aria-hidden="true"></span>
+                  <strong>深色</strong>
+                  <small>极简黑 + 青绿</small>
+                </button>
+                <button type="button" class="theme-pick" data-theme="light">
+                  <span class="theme-swatch theme-swatch-light" aria-hidden="true"></span>
+                  <strong>浅色</strong>
+                  <small>极简白 + 灰蓝</small>
+                </button>
+              </div>
+            </section>
+            <section class="settings-pane" id="pane-translate" hidden>
+              <h3>翻译</h3>
+              <div class="settings-stack">
+                <div class="settings-field">
+                  翻译引擎
+                  <div class="engine-picks" id="trEngine">
+                    <button type="button" class="engine-pick active" data-engine="deepseek">DeepSeek</button>
+                    <button type="button" class="engine-pick" data-engine="openai">OpenAI</button>
+                    <button type="button" class="engine-pick" data-engine="custom">自定义</button>
+                  </div>
+                </div>
+                <label class="settings-field">API Key
+                  <span class="key-wrap">
+                    <input id="trKey" class="is-masked" type="text" name="translate_api_key" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="粘贴 API Key" />
+                    <button type="button" class="key-eye" id="trKeyToggle" title="显示密钥" aria-label="显示密钥">
+                      <svg class="eye-on" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
+                        <circle cx="12" cy="12" r="3"/>
+                      </svg>
+                      <svg class="eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M3 3l18 18"/>
+                        <path d="M10.6 10.6a3 3 0 0 0 4.2 4.2"/>
+                        <path d="M9.5 5.2A11 11 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-4.2 4.8"/>
+                        <path d="M6.1 6.1C3.6 7.8 2 12 2 12s3.5 7 10 7a10 10 0 0 0 4.3-.9"/>
+                      </svg>
+                    </button>
+                  </span>
+                </label>
+                <div id="trCustomBox" hidden>
+                  <label class="settings-field">API 地址
+                    <input id="trBase" type="text" placeholder="https://api.example.com/v1/chat/completions" />
+                  </label>
+                  <label class="settings-field">模型
+                    <input id="trModel" type="text" placeholder="如 gpt-4o-mini" />
+                  </label>
+                </div>
+                <div class="settings-actions tr-test-row">
+                  <button type="button" class="ghost" id="trTest">测试连接</button>
+                  <span id="trTestHint" class="tr-test-hint"></span>
+                </div>
+                <div class="tr-lang-row">
+                  <label class="settings-field tr-lang-field">目标语言
+                    <select id="trTarget">
+                      <option value="zh-CN">简体中文</option>
+                      <option value="zh-TW">繁体中文</option>
+                      <option value="en">English</option>
+                      <option value="ja">日本語</option>
+                      <option value="ko">한국어</option>
+                    </select>
+                  </label>
+                  <label class="settings-toggle"><input id="trAuto" type="checkbox" /> 自动翻译</label>
+                </div>
+                <div class="settings-actions">
+                  <button type="button" id="trSave">保存</button>
+                </div>
+              </div>
+            </section>
+            <section class="settings-pane" id="pane-privacy" hidden>
+              <h3>存储</h3>
+              <div class="settings-card">
+                <p class="settings-kicker">应用安装位置</p>
+                <p class="settings-path"><code id="installPathText">—</code></p>
+              </div>
+              <div class="settings-card">
+                <p class="settings-kicker">数据存储位置</p>
+                <div class="storage-path-row">
+                  <p class="settings-path"><code id="dataPathText">—</code></p>
+                  <div class="settings-actions storage-path-actions">
+                    <button type="button" id="storageChangeBtn">更改位置</button>
+                    <button type="button" class="ghost" id="storageOpenBtn">打开位置</button>
+                  </div>
+                </div>
+                <p class="settings-note muted" id="storageStatus"></p>
+              </div>
+            </section>
+            <section class="settings-pane" id="pane-about" hidden>
+              <h3>关于</h3>
+              <p class="settings-lead">PuMail · Less is more</p>
+              <div class="about-list">
+                <div class="about-row">
+                  <span>版本信息</span>
+                  <span class="about-value">V1.0.0</span>
+                </div>
+                <div class="about-row">
+                  <span>用户手册</span>
+                  <a class="about-action" href="help.html" target="_blank" rel="noopener">查看帮助</a>
+                </div>
+              </div>
+              <div class="about-foot">
+                <a href="privacy.html" target="_blank" rel="noopener">隐私协议</a>
+                <span class="about-foot-sep" aria-hidden="true">|</span>
+                <a href="https://tally.so/r/A7ZWGB" target="_blank" rel="noopener">意见反馈</a>
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="overlay" id="accountOverlay" hidden>
+      <form class="compose" id="accountForm" novalidate>
+        <header>
+          <h2>添加邮箱账号</h2>
+          <button type="button" class="icon-close" id="closeAccountForm" aria-label="关闭">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </header>
+        <label class="acc-email-field">邮箱地址
+          <div class="acc-email-row">
+            <div class="acc-email-wrap">
+              <input id="accEmailInput" type="text" inputmode="email" autocomplete="off" autocapitalize="off" spellcheck="false" required placeholder="name@qq.com" />
+              <div class="field-hint" id="accEmailHint" hidden>
+                <svg class="field-hint-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/>
+                  <path d="M12 8v5.2M12 16.3v.8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+                <span id="accEmailHintText">请输入包含 @ 的有效邮箱地址</span>
+              </div>
+              <ul class="email-suggest" id="accEmailSuggest" hidden></ul>
+            </div>
+            <button type="button" class="guide-btn" id="guideBtn" title="打开邮箱绑定指南">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+              邮箱绑定指南
+            </button>
+          </div>
+        </label>
+        <label>显示名称<input id="accNameInput" type="text" placeholder="可选，如：我的工作邮箱" /></label>
+        <label>服务商
+          <select id="accProviderInput">
+            <option value="qq">QQ邮箱</option>
+            <option value="163">163邮箱</option>
+            <option value="126">126邮箱</option>
+            <option value="gmail">Gmail</option>
+            <option value="outlook">Outlook</option>
+            <option value="icloud">iCloud</option>
+            <option value="custom">自定义</option>
+          </select>
+        </label>
+        <label id="accPasswordLabel">授权码 / 应用专用密码
+          <span class="key-wrap">
+            <input id="accPasswordInput" type="password" required autocomplete="new-password" placeholder="不是登录密码！见下方提示" />
+            <button type="button" class="key-eye" id="accPwToggle" title="显示授权码" aria-label="显示授权码" aria-pressed="false">
+              <svg class="eye-on" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+              <svg class="eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 3l18 18"/>
+                <path d="M10.6 10.6a3 3 0 0 0 4.2 4.2"/>
+                <path d="M9.5 5.2A11 11 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-4.2 4.8"/>
+                <path d="M6.1 6.1C3.6 7.8 2 12 2 12s3.5 7 10 7a10 10 0 0 0 4.3-.9"/>
+              </svg>
+            </button>
+          </span>
+          <span class="caps-hint" id="accCapsHint" hidden>已开启 Caps Lock（大写锁定）</span>
+        </label>
+        <div id="outlookOauthBox" hidden>
+          <div class="oauth-code-wrap" id="outlookCodeWrap" hidden>
+            <span class="oauth-code-label">在打开的网页输入此代码</span>
+            <strong id="outlookUserCode" class="oauth-code"></strong>
+          </div>
+        </div>
+        <div id="customServerBox" hidden>
+          <label>IMAP 主机 <input id="accImapHost" type="text" placeholder="imap.example.com" /></label>
+          <label>IMAP 端口 <input id="accImapPort" type="text" value="993" /></label>
+          <label>SMTP 主机 <input id="accSmtpHost" type="text" placeholder="smtp.example.com" /></label>
+          <label>SMTP 端口 <input id="accSmtpPort" type="text" value="465" /></label>
+          <label class="inline-check"><input id="accStarttls" type="checkbox" /> 使用 STARTTLS（如 Outlook 587 端口）</label>
+        </div>
+        <p class="form-tip" id="accFormTip">提示：QQ/163 邮箱 → 网页版「设置 → 账户」开启 IMAP 并生成授权码。Gmail 请先开两步验证，再用 16 位应用专用密码，不能用登录密码。</p>
+        <footer>
+          <button type="button" id="outlookLoginBtn" hidden>用 Microsoft 登录</button>
+          <button type="submit" id="accSubmitBtn">添加账号</button>
+        </footer>
+      </form>
+    </div>
+
+    <div class="overlay" id="sendAccOverlay" hidden>
+      <div class="compose confirm-box send-acc-box" role="dialog" aria-labelledby="sendAccTitle">
+        <p id="sendAccTitle">使用哪个邮箱发送？</p>
+        <div class="send-acc-list" id="sendAccList"></div>
+        <footer>
+          <button type="button" class="ghost" id="sendAccCancel">取消</button>
+        </footer>
+      </div>
+    </div>
+
+    <div class="overlay" id="leaveOverlay" hidden>
+      <div class="compose confirm-box leave-box">
+        <p id="leaveTitle">退出这个账号？</p>
+        <p class="leave-desc" id="leaveDesc">是否删除与该邮箱相关的本地数据？选择「保留」则留下本机缓存，选择「不保留」将彻底清除。服务器上的邮件不会被删除。</p>
+        <footer>
+          <button type="button" class="ghost" id="leaveCancel">取消</button>
+          <button type="button" id="leaveKeep">保留</button>
+          <button type="button" class="danger" id="leavePurge">不保留</button>
+        </footer>
+      </div>
+    </div>
+
+    <div class="overlay" id="vaultSetupOverlay" hidden>
+      <form class="compose confirm-box vault-box" id="vaultSetupForm" autocomplete="off">
+        <header>
+          <h2>设置主密码</h2>
+          <button type="button" class="icon-close" id="closeVaultSetup" aria-label="关闭">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </header>
+        <p class="leave-desc">主密码用于加密并打开本机保存的授权码、应用密码和 API 密钥。请务必牢记，忘记后只能清除全部密码数据。</p>
+        <label>主密码
+          <span class="key-wrap">
+            <input id="vaultSetupInput" type="password" autocomplete="new-password" placeholder="至少 6 位" />
+            <button type="button" class="key-eye" id="vaultSetupToggle" title="显示主密码" aria-label="显示主密码" aria-pressed="false">
+              <svg class="eye-on" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+              <svg class="eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 3l18 18"/>
+                <path d="M10.6 10.6a3 3 0 0 0 4.2 4.2"/>
+                <path d="M9.5 5.2A11 11 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-4.2 4.8"/>
+                <path d="M6.1 6.1C3.6 7.8 2 12 2 12s3.5 7 10 7a10 10 0 0 0 4.3-.9"/>
+              </svg>
+            </button>
+          </span>
+        </label>
+        <label>确认主密码
+          <input id="vaultSetupConfirm" type="password" autocomplete="new-password" placeholder="再输入一次" />
+        </label>
+        <p class="vault-error" id="vaultSetupError" hidden></p>
+        <footer>
+          <button type="button" class="ghost" id="vaultSetupCancel">取消</button>
+          <button type="submit">确认</button>
+        </footer>
+      </form>
+    </div>
+
+    <div class="overlay" id="vaultUnlockOverlay" hidden>
+      <form class="compose confirm-box vault-box" id="vaultUnlockForm" autocomplete="off">
+        <header>
+          <h2>输入主密码</h2>
+          <button type="button" class="icon-close" id="closeVaultUnlock" aria-label="关闭">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </header>
+        <p class="leave-desc">输入主密码后可查看本机保存的邮箱授权码、应用密码和 API 密钥。</p>
+        <label>主密码
+          <span class="key-wrap">
+            <input id="vaultUnlockInput" type="password" autocomplete="current-password" placeholder="输入主密码" />
+            <button type="button" class="key-eye" id="vaultUnlockToggle" title="显示主密码" aria-label="显示主密码" aria-pressed="false">
+              <svg class="eye-on" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+              <svg class="eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 3l18 18"/>
+                <path d="M10.6 10.6a3 3 0 0 0 4.2 4.2"/>
+                <path d="M9.5 5.2A11 11 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-4.2 4.8"/>
+                <path d="M6.1 6.1C3.6 7.8 2 12 2 12s3.5 7 10 7a10 10 0 0 0 4.3-.9"/>
+              </svg>
+            </button>
+          </span>
+        </label>
+        <p class="vault-error" id="vaultUnlockError" hidden></p>
+        <footer>
+          <button type="button" class="ghost" id="vaultForgotBtn">忘记主密码</button>
+          <button type="submit" id="vaultUnlockSubmit">确认</button>
+        </footer>
+      </form>
+    </div>
+
+    <div class="overlay" id="vaultListOverlay" hidden>
+      <div class="compose vault-list-box" role="dialog" aria-labelledby="vaultListTitle">
+        <header>
+          <h2 id="vaultListTitle">密码管理</h2>
+          <button type="button" class="icon-close" id="closeVaultList" aria-label="关闭">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </header>
+        <div class="vault-list-body" id="vaultListBody"></div>
+      </div>
+    </div>
+
+    <div class="overlay" id="confirmOverlay" hidden>
+      <div class="compose confirm-box">
+        <p id="confirmText"></p>
+        <footer>
+          <button type="button" class="ghost" id="confirmNo">取消</button>
+          <button type="button" id="confirmYes">确定</button>
+        </footer>
+      </div>
+    </div>
+
+    <div class="ctx-menu" id="ctxMenu" hidden>
+      <button type="button" data-act="star" aria-label="星标">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
+        <span>星标</span>
+      </button>
+      <button type="button" data-act="pin" aria-label="置顶">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z"/></svg>
+        <span>置顶</span>
+      </button>
+      <button type="button" data-act="delete" aria-label="删除">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+        <span>删除</span>
+      </button>
+    </div>
+
+    <script src="app.js?v=114"></script>
+  </body>
+</html>

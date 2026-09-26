@@ -1,0 +1,42 @@
+# ===== 运行时数据 =====
+pupumail.db
+pupumail.secret
+*.db-wal
+*.db-shm
+*.vault
+.pumail/
+.PuMail/
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ===== Node / Electron =====
+electron/node_modules/
+electron/build/
+electron/dist/
+
+# ===== 打包产物 =====
+*.exe
+*.msi
+*.dmg
+*.AppImage
+
+# ===== 日志与调试 =====
+*.log
+imap-debug.log
+
+# ===== IDE / 编辑器 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+
+# ===== 其他 =====
+useless/
