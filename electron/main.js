@@ -133,11 +133,13 @@ ipcMain.handle('flash-taskbar', async () => {
   if (window.isFocused()) return { ok: true };
   // 闪烁任务栏图标
   window.flashFrame(true);
-  // 3 秒后自动停止闪烁
+  // 同时让右下角托盘图标闪烁（有声音之外再加一个视觉提醒）
+  startTrayBlink();
+  // 15 秒后自动停止任务栏闪烁
   if (_flashTimer) clearTimeout(_flashTimer);
   _flashTimer = setTimeout(() => {
     if (window) window.flashFrame(false);
-  }, 3000);
+  }, 15000);
   return { ok: true };
 });
 
@@ -233,6 +235,7 @@ function stopBackend() {
 }
 
 function showWindow() {
+  stopTrayBlink();
   if (!window) {
     createWindow();
     return;
@@ -253,9 +256,7 @@ function quitApp() {
 
 function createTray() {
   if (tray) return;
-  const src = appIcon();
-  const image = src ? src.resize({ width: 16, height: 16 }) : nativeImage.createEmpty();
-  tray = new Tray(image);
+  tray = new Tray(trayNormalImage());
   tray.setToolTip('PuMail');
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '打开 PuMail', click: showWindow },
@@ -263,6 +264,60 @@ function createTray() {
     { label: '退出', click: quitApp },
   ]));
   tray.on('click', showWindow);
+}
+
+/* ---------- 托盘图标闪烁（有新邮件时） ----------
+   在"正常图标"和"红色提示圆点"之间来回切换，直到窗口被打开。
+   红色圆点直接内嵌成 base64，不需要额外的图标文件。 */
+const TRAY_ALERT_PNG = 'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAIhSURBVFhH1Ze9SwNBEMUtLVNa+idY2o1bWQkBG7vYBAQbrbQJCKnSaBNIm87S0tIypEollseeyvkVg1WMiifv2DtyM3ufOQUf/DjIzu7szu69zS0t/Vc5ROu3RBvz8JhK5RCtaKI9rdSlq5SfwkATHTtEq3yMUnKIalqpE1epqSVZFj1MnI+ZWyirq9TEMnARpi7RDh87U5pot+SqraCKPEeiTHIxSAWc8VxCpuyVrZyDg8xzRsKBKbLnXrPpPx4eBk/elsLUIVrjuQOhRJYOgrutLX86HPrzml1f+16jIWJtaKUueO5w9blK/z4axZKH+tDav93cFPE2RBVgHjzIxsP+Ps8b03OrJfok0ItNAA5mCRK8np7ynDG99fuiTwJelBxuZwmw8nR0xHPGNO50RJ8kom3AxcIbk8Aef3oezxvoezbz77e3RZ9EQod0ieqiMQWcg6/xWCR/abdFbBqa6CCYAMyBN2aBV3HS7QZ7jmehlRsie0YpeONfgDcvmICxXxHw2+DOCQ8hTEgEZFHSiiNw+M2LGPiAwwOSWNSKDbgTlucnkOseAFVYsbgPYAo8yEZlVkxUj00AwqxEIKMiKx7x3IHyVKESK7atPlTWrViBFcdvQZu0UueWjhELWPEgdvKThKCsSZSwYiSv8VypMh8kfKAy4AMle+U2GZu+sgyah5vUA1dEGMhsS+b/Rnw/Rj7/G0JV8LZgi+bB70VL/QMQKG3puuWUDwAAAABJRU5ErkJggg==';
+
+let _trayBlinkTimer = null;
+let _trayBlinkOn = false;
+
+function trayNormalImage() {
+  const src = appIcon();
+  return src ? src.resize({ width: 16, height: 16 }) : nativeImage.createEmpty();
+}
+
+function trayAlertImage() {
+  const img = nativeImage.createFromBuffer(Buffer.from(TRAY_ALERT_PNG, 'base64'));
+  if (img.isEmpty()) return trayNormalImage();
+  return img.resize({ width: 16, height: 16 });
+}
+
+function startTrayBlink(durationMs) {
+  if (!tray) return;
+  // 默认闪 10 分钟，或者直到用户打开窗口（showWindow 里会停）
+  const total = durationMs || 10 * 60 * 1000;
+  if (_trayBlinkTimer) clearInterval(_trayBlinkTimer);
+  const startedAt = Date.now();
+  _trayBlinkTimer = setInterval(() => {
+    if (!tray || Date.now() - startedAt > total) {
+      stopTrayBlink();
+      return;
+    }
+    _trayBlinkOn = !_trayBlinkOn;
+    try {
+      tray.setImage(_trayBlinkOn ? trayAlertImage() : trayNormalImage());
+    } catch (err) {
+      /* 图标切换失败不影响收信 */
+    }
+  }, 600);
+}
+
+function stopTrayBlink() {
+  if (_trayBlinkTimer) {
+    clearInterval(_trayBlinkTimer);
+    _trayBlinkTimer = null;
+  }
+  _trayBlinkOn = false;
+  if (tray) {
+    try {
+      tray.setImage(trayNormalImage());
+    } catch (err) {
+      /* 忽略 */
+    }
+  }
 }
 
 async function createWindow() {
