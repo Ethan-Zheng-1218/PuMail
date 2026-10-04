@@ -1828,6 +1828,8 @@ def smtp_send(acc, to_addrs, msg):
             return
         except Exception as e:
             errors.append(f'{kind} {h}:{p} → {e}')
+            # 把每次失败的细节写进调试日志，方便排查"发不出去"
+            imap_log(acc, 'SMTP fail', kind, h, p, type(e).__name__, e)
         finally:
             if smtp is not None:
                 try:
@@ -4349,6 +4351,7 @@ def api_send():
         smtp_send(acc, all_addrs, msg)
         cache_bust(acc['id'])
     except Exception as e:
+        imap_log(acc, 'SEND fail', type(e).__name__, e)
         return jsonify({'error': f'发送失败：{e}'}), 400
     sent_id = db_folder_label(acc['id'], '已发送')
     saved = False
