@@ -55,6 +55,11 @@ PAGE_SCAN = 50
 PAIR_SCAN = 160
 _IMAP_MON = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()
 
+# 端口：打包版由 Electron 指定成 5211，网页预览版仍然是 5000，两者互不干扰。
+# （以前两边都用 5000，打包版会悄悄连上正在运行的网页预览版，导致改动看起来"没生效"。）
+PORT = int(os.environ.get('PUMAIL_PORT') or 5000)
+BASE_URL = 'http://127.0.0.1:%d' % PORT
+
 from flask import (Flask, abort, jsonify, make_response, request,
                    send_file, send_from_directory)
 
@@ -2338,6 +2343,9 @@ def after_request(resp):
 @app.before_request
 def before_request():
     if request.path.startswith('/api/'):
+        # /api/ping 是给 Electron 外壳"认门牌"用的（只返回应用名、进程号和端口），不需要授权
+        if request.path == '/api/ping':
+            return None
         if request.cookies.get('pupu_ok') != APP_SECRET:
             return jsonify({'error': '未授权，请从首页打开 PuMail'}), 401
     return None
@@ -5328,6 +5336,12 @@ def stop_all_idle_threads():
         _stop_idle_for_account(aid)
 
 
+@app.route('/api/ping')
+def api_ping():
+    """给 Electron 外壳用来确认"这个端口对面是不是我们自己的后端"。"""
+    return jsonify({'app': 'pumail', 'pid': os.getpid(), 'port': PORT})
+
+
 @app.route('/api/notifications')
 def api_notifications():
     """前端轮询待处理通知。返回后清除。"""
@@ -5342,13 +5356,13 @@ _quiet_sync_error_logs()
 
 if __name__ == '__main__':
     init_db()
-    print('PuMail 启动成功 -> http://127.0.0.1:5000')
+    print('PuMail 启动成功 -> %s（端口 %d）' % (BASE_URL, PORT))
     if os.environ.get('PUMAIL_NO_BROWSER') != '1':
-        webbrowser.open('http://127.0.0.1:5000')
+        webbrowser.open(BASE_URL)
 
     # 启动 IDLE/轮询线程
     import atexit
     atexit.register(stop_all_idle_threads)
     sync_idle_threads()
 
-    app.run(host='127.0.0.1', port=5000, debug=False)
+    app.run(host='127.0.0.1', port=PORT, debug=False)

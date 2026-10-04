@@ -4,7 +4,9 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 
-const PORT = 5000;
+// 打包版用独立端口（5211），网页预览版仍然是 5000：两者可以同时存在，互不干扰。
+// 以前两边都用 5000，打包版一看到有人在应答就直接用它，结果连到了旧代码的服务上。
+const PORT = Number(process.env.PUMAIL_PORT) || (app.isPackaged ? 5211 : 5000);
 const HOME = `http://127.0.0.1:${PORT}`;
 const AUTOSTART_KEY = 'Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const AUTOSTART_NAME = 'PuMail';
@@ -194,6 +196,26 @@ function pageIsUp() {
   });
 }
 
+// 问一下"这个端口对面是谁"：返回后端信息、null（没人应答）、{other:true}（不是 PuMail）
+function probeBackend() {
+  return new Promise((resolve) => {
+    const req = http.get(HOME + '/api/ping', (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        try {
+          const d = JSON.parse(body);
+          resolve(d && d.app === 'pumail' ? d : { other: true });
+        } catch (err) {
+          resolve({ other: true });
+        }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(900, () => { req.destroy(); resolve(null); });
+  });
+}
+
 function waitForPage() {
   const started = Date.now();
   return new Promise((resolve, reject) => {
@@ -212,7 +234,7 @@ function startBackend() {
     dialog.showErrorBox('PuMail', '没有找到程序文件：\n' + exe);
     return;
   }
-  const env = { ...process.env, PUMAIL_NO_BROWSER: '1' };
+  const env = { ...process.env, PUMAIL_NO_BROWSER: '1', PUMAIL_PORT: String(PORT) };
   server = spawn(exe, [], {
     cwd: serverDir(),
     env,
@@ -318,7 +340,25 @@ async function createWindow() {
     showWindow();
     return;
   }
-  if (!(await pageIsUp())) startBackend();
+
+  const owner = await probeBackend();
+  if (owner === null) {
+    startBackend();                       // 端口空着：启动我们自己的后端
+  } else if (owner.app === 'pumail' && owner.pid && owner.pid !== process.pid) {
+    // 端口上已经有一个 PuMail 后端在跑（多半是上次没退干净）：结束它，换成我们自己的
+    spawn('taskkill', ['/pid', String(owner.pid), '/f', '/t'], { windowsHide: true });
+    await new Promise((r) => setTimeout(r, 800));
+    startBackend();
+  } else {
+    dialog.showErrorBox(
+      'PuMail',
+      '端口 ' + PORT + ' 被其它程序占用了，PuMail 无法启动。\n\n' +
+      '请打开任务管理器，结束所有 PuMail 进程后重试。'
+    );
+    quitApp();
+    return;
+  }
+
   try {
     await waitForPage();
   } catch (err) {
