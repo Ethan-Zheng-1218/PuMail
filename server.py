@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import html as html_mod
 import imaplib
+import sync_queue
 import io
 import json
 import logging
@@ -2492,7 +2493,8 @@ def boot_seed_account(acc):
 
 _boot_sync_lock = threading.Lock()
 _boot_sync_busy = set()
-_boot_sync_pool = ThreadPoolExecutor(max_workers=4)
+# 启动同步按账号一个一个来（以前是 4 个账号一起冲，日志里的 imap busy 就来自这里）
+_boot_sync_pool = ThreadPoolExecutor(max_workers=1)
 
 
 def boot_sync_account(acc):
@@ -2514,8 +2516,10 @@ def boot_sync_account(acc):
             if fid and fid not in targets:
                 targets.append(fid)
         for fol in targets:
+            # 收件箱优先，草稿/已发送排最后；都算后台任务，给用户正在等待的操作让位
+            prio = sync_queue.PRIORITY_OTHER if fol == 'INBOX' else sync_queue.PRIORITY_BACKGROUND
             try:
-                sync_folder_headers(acc, fol, limit=BOOT_MAIL_LIMIT)
+                sync_folder_headers(acc, fol, limit=BOOT_MAIL_LIMIT, priority=prio)
             except Exception:
                 pass
     finally:
@@ -3214,11 +3218,14 @@ def imap_get(acc, ping=True, timeout=30):
     return conn
 
 
-def with_imap(acc, fn, ping=True, retry=True, timeout=30):
+def _with_imap_locked(acc, fn, ping=True, retry=True, timeout=30):
+    """真正执行 IMAP 操作。调用方保证同一账号串行（见 with_imap）。"""
     lock = acc_lock(acc['id'])
-    got = lock.acquire(timeout=8)
+    # 队列已经保证同一账号串行，这里的锁只是兜底；
+    # 以前这里只等 8 秒就抛 "imap busy"，会让界面弹出"同步失败"。
+    got = lock.acquire(timeout=300)
     if not got:
-        raise TimeoutError('imap busy')
+        raise TimeoutError('账号连接被长时间占用，请稍后再试')
     try:
         try:
             return fn(imap_get(acc, ping=ping, timeout=timeout))
@@ -3234,6 +3241,22 @@ def with_imap(acc, fn, ping=True, retry=True, timeout=30):
             return fn(imap_get(acc, ping=True, timeout=timeout))
     finally:
         lock.release()
+
+
+def with_imap(acc, fn, ping=True, retry=True, timeout=30, priority=None):
+    """所有账号相关的 IMAP 操作都排进该账号的队列，串行执行。
+
+    · 同一账号同一时刻只有一个操作在用连接，不再互相抢锁；
+    · 默认优先级是"用户正在等待"（点开文件夹、手动刷新）；
+    · 后台任务传 sync_queue.PRIORITY_BACKGROUND，会主动给用户操作让位。
+    """
+    if priority is None:
+        priority = sync_queue.PRIORITY_USER
+    return sync_queue.run(
+        acc['id'],
+        lambda: _with_imap_locked(acc, fn, ping=ping, retry=retry, timeout=timeout),
+        priority=priority,
+    )
 
 
 def db_save_folders(acc_id, folders):
@@ -3584,7 +3607,7 @@ def pop_sync_errors():
         return out
 
 
-def sync_folder_headers(acc, folder, limit=None):
+def sync_folder_headers(acc, folder, limit=None, priority=None):
     if not folder or folder == STARRED_ID or is_demo_account(acc):
         return
 
@@ -3618,7 +3641,7 @@ def sync_folder_headers(acc, folder, limit=None):
             old = get_oldest_uid(acc['id'], folder)
             set_folder_state(acc['id'], folder, top, oldest_uid=old or fetched_low)
 
-    with_imap(acc, work)
+    with_imap(acc, work, priority=priority)
 
 
 def fetch_older_headers(acc, folder, limit=PER_PAGE):
