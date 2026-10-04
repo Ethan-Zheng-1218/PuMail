@@ -3642,6 +3642,8 @@ def sync_folder_headers(acc, folder, limit=None, priority=None):
             set_folder_state(acc['id'], folder, top, oldest_uid=old or fetched_low)
 
     with_imap(acc, work, priority=priority)
+    # 记下最后一次同步时间，供"新鲜度"判断使用
+    mark_folder_synced(acc['id'], folder)
 
 
 def fetch_older_headers(acc, folder, limit=PER_PAGE):
@@ -3979,7 +3981,7 @@ def prefetch_unread_bodies(acc, folder, limit=8):
             break
 
 
-def background_sync(acc, folder=None):
+def background_sync(acc, folder=None, force=True):
     if is_demo_account(acc):
         return
     key = f"{acc['id']}|{folder or '*'}"
@@ -4003,8 +4005,11 @@ def background_sync(acc, folder=None):
                 if not fol or fol in seen:
                     continue
                 seen.add(fol)
-                sync_folder_headers(acc, fol, limit=FIRST_BATCH)
-                backfill_missing_dates(acc, fol)
+                # force=True 照旧每次都同步（发信/删除等操作后要立刻刷新）；
+                # 打开文件夹时传 force=False，只有超过新鲜度阈值才真正联网。
+                if force or folder_needs_sync(acc['id'], fol):
+                    sync_folder_headers(acc, fol, limit=FIRST_BATCH)
+                    backfill_missing_dates(acc, fol)
             prefetch_unread_bodies(acc, folder if folder and folder != STARRED_ID else 'INBOX', limit=12)
         except Exception as e:
             push_sync_error('同步失败：' + str(e))
@@ -4121,7 +4126,9 @@ def api_mails():
         sent_id = resolve_mail_folder(acc['id'], sent_id)
     fresh = request.args.get('fresh') == '1'
     was_empty = not folder_has_mail(acc['id'], real_folder)
-    if (was_empty or fresh) and not is_demo_account(acc):
+    # 收件箱每次都刷；其它文件夹一天刷一次就够了
+    stale = folder_needs_sync(acc['id'], real_folder)
+    if (was_empty or fresh or stale) and not is_demo_account(acc):
         imap_log(acc, 'MAILS sync', 'folder', folder, 'empty', was_empty, 'fresh', fresh)
         try:
             if folder != STARRED_ID:
@@ -4158,7 +4165,7 @@ def api_mails():
     imap_more = (folder != STARRED_ID and not q and not is_demo_account(acc)
                  and not folder_caught_up(acc['id'], real_folder))
     sibling_folder = sibling_items = None
-    background_sync(acc, real_folder if folder != STARRED_ID else 'INBOX')
+    background_sync(acc, real_folder if folder != STARRED_ID else 'INBOX', force=False)
     unread_count = folder_unread_count(acc['id'], real_folder)
     return jsonify({
         'items': items,
@@ -4169,7 +4176,7 @@ def api_mails():
         'has_more': local_more or imap_more,
         'sent_unread': bool(cache_get(f"{acc['id']}|sent_unread")),
         'needs_deep': False,
-        'syncing': was_empty or head,
+        'syncing': was_empty or stale or head,
         'sibling_folder': sibling_folder,
         'sibling_items': sibling_items,
         'errors': pop_sync_errors(),
@@ -4692,6 +4699,36 @@ def setting_set(key, value):
                (key, value))
     db.commit()
     db.close()
+
+
+# ---------- 文件夹"新鲜度"（决定打开文件夹时要不要联网同步） ----------
+# 收件箱最重要：打开就刷；其它文件夹（已发送/草稿/垃圾箱…）一般不变，一天刷一次就够。
+INBOX_SYNC_TTL = 0
+FOLDER_SYNC_TTL = 24 * 3600
+
+
+def folder_synced_at(acc_id, folder):
+    """该文件夹最后一次同步成功的时间戳；从未同步过返回 0。"""
+    try:
+        raw = setting_get('folder_synced:%s:%s' % (acc_id, folder or ''))
+        return float(raw) if raw else 0.0
+    except Exception:
+        return 0.0
+
+
+def mark_folder_synced(acc_id, folder):
+    if not folder:
+        return
+    try:
+        setting_set('folder_synced:%s:%s' % (acc_id, folder), str(time.time()))
+    except Exception:
+        pass
+
+
+def folder_needs_sync(acc_id, folder):
+    """超过新鲜度阈值就需要联网同步。收件箱阈值是 0，即每次都刷。"""
+    ttl = INBOX_SYNC_TTL if (folder or '').upper() == 'INBOX' else FOLDER_SYNC_TTL
+    return (time.time() - folder_synced_at(acc_id, folder)) > ttl
 
 
 # ---------- 开机自启动 ----------

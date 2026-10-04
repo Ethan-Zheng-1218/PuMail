@@ -302,6 +302,27 @@ html:not(.theme-light) .refresh-btn img {
   z-index: 2;
 }
 .list-loading[hidden] { display: none !important; }
+.list-syncing {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: #8b939c;
+  text-align: center;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.list-syncing[hidden] { display: none !important; }
+.list-syncing::before {
+  content: '';
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 6px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  vertical-align: -1px;
+  animation: pumail-sync-spin 0.8s linear infinite;
+}
+@keyframes pumail-sync-spin { to { transform: rotate(360deg); } }
 .mail-list::-webkit-scrollbar { display: none; width: 0; height: 0; }
 .mail-row {
   display: flex; gap: 10px; align-items: center; padding: 12px 14px; border-bottom: 1px solid #2d3436; cursor: pointer; font-size: 14px; color: #dfe4ea;
@@ -1898,6 +1919,7 @@ html.theme-light .list-loading {
   color: #6b7280;
   background: linear-gradient(transparent, #f7f8fa 35%);
 }
+html.theme-light .list-syncing { color: #6b7280; border-bottom-color: #e8ebef; }
 html.theme-light .mail-row { color: #374151; border-bottom-color: #e8ebef; }
 html.theme-light .mail-row:hover,
 html.theme-light .mail-row.active { background: #eef1f4; }

@@ -1957,6 +1957,7 @@ function showFolderMails(opts = {}) {
     cached.items = expandOtpThreads(cached.items);
     paintList(cached);
     updateListLoading();
+    setListSyncing(false);
     fetchFolderMails({ background: true, merge: true });
     return;
   }
@@ -1965,6 +1966,8 @@ function showFolderMails(opts = {}) {
   showSkeletons(5);
   updateBatchBar();
   updateListLoading();
+  // 本地没有这个文件夹的数据，需要联网同步：中间栏先给出提示，别让用户干等
+  setListSyncing(true, '正在同步…');
   fetchFolderMails({ head: true, fresh: !!opts.fresh });
 }
 
@@ -2000,6 +2003,10 @@ async function fetchFolderMails(opts = {}) {
       }
     }
     const d = await api((isGaia() ? '/api/gaia/mails?' : '/api/mails?') + params);
+    // 后端告诉我们这个文件夹正在同步时，中间栏显示"正在同步…"
+    if (state.acc === acc && state.folder === folder) {
+      setListSyncing(!!d.syncing, d.syncing ? '正在同步…' : '');
+    }
     applyUnreadSummary(d.unread_summary);
     renderAccountBar();
     if (d.sent_unread != null) applySentUnread(d.sent_unread);
@@ -2066,7 +2073,10 @@ async function fetchFolderMails(opts = {}) {
       updateListLoading();
     }
   } catch (err) {
-    if (!opts.background && gen === state.listGen) toast('加载失败：' + err.message);
+    if (!opts.background && gen === state.listGen) {
+      setListSyncing(false);
+      toast('加载失败：' + err.message);
+    }
   } finally {
     if (gen === state.listGen) state.loading = false;
     updateListLoading();
@@ -2078,6 +2088,14 @@ function updateListLoading() {
   if (!el) return;
   el.hidden = !state.loadingMore;
   el.textContent = '正在加载更早的邮件…';
+}
+
+/* 中间那栏的"正在同步…"提示：打开文件夹、数据不新鲜时显示 */
+function setListSyncing(on, text) {
+  const el = $('listSyncing');
+  if (!el) return;
+  if (text) el.textContent = text;
+  el.hidden = !on;
 }
 
 async function loadMoreMails() {
