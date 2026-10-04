@@ -267,22 +267,14 @@ function createTray() {
 }
 
 /* ---------- 托盘图标闪烁（有新邮件时） ----------
-   在"正常图标"和"红色提示圆点"之间来回切换，直到窗口被打开。
-   红色圆点直接内嵌成 base64，不需要额外的图标文件。 */
-const TRAY_ALERT_PNG = 'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAIhSURBVFhH1Ze9SwNBEMUtLVNa+idY2o1bWQkBG7vYBAQbrbQJCKnSaBNIm87S0tIypEollseeyvkVg1WMiifv2DtyM3ufOQUf/DjIzu7szu69zS0t/Vc5ROu3RBvz8JhK5RCtaKI9rdSlq5SfwkATHTtEq3yMUnKIalqpE1epqSVZFj1MnI+ZWyirq9TEMnARpi7RDh87U5pot+SqraCKPEeiTHIxSAWc8VxCpuyVrZyDg8xzRsKBKbLnXrPpPx4eBk/elsLUIVrjuQOhRJYOgrutLX86HPrzml1f+16jIWJtaKUueO5w9blK/z4axZKH+tDav93cFPE2RBVgHjzIxsP+Ps8b03OrJfok0ItNAA5mCRK8np7ynDG99fuiTwJelBxuZwmw8nR0xHPGNO50RJ8kom3AxcIbk8Aef3oezxvoezbz77e3RZ9EQod0ieqiMQWcg6/xWCR/abdFbBqa6CCYAMyBN2aBV3HS7QZ7jmehlRsie0YpeONfgDcvmICxXxHw2+DOCQ8hTEgEZFHSiiNw+M2LGPiAwwOSWNSKDbgTlucnkOseAFVYsbgPYAo8yEZlVkxUj00AwqxEIKMiKx7x3IHyVKESK7atPlTWrViBFcdvQZu0UueWjhELWPEgdvKThKCsSZSwYiSv8VypMh8kfKAy4AMle+U2GZu+sgyah5vUA1dEGMhsS+b/Rnw/Rj7/G0JV8LZgi+bB70VL/QMQKG3puuWUDwAAAABJRU5ErkJggg==';
-
+   像微信那样闪：一会儿是空白，一会儿显示原来的图标，来回切换，
+   直到窗口被打开或者满 10 分钟。不需要任何额外的图标文件。 */
 let _trayBlinkTimer = null;
 let _trayBlinkOn = false;
 
 function trayNormalImage() {
   const src = appIcon();
   return src ? src.resize({ width: 16, height: 16 }) : nativeImage.createEmpty();
-}
-
-function trayAlertImage() {
-  const img = nativeImage.createFromBuffer(Buffer.from(TRAY_ALERT_PNG, 'base64'));
-  if (img.isEmpty()) return trayNormalImage();
-  return img.resize({ width: 16, height: 16 });
 }
 
 function startTrayBlink(durationMs) {
@@ -298,11 +290,12 @@ function startTrayBlink(durationMs) {
     }
     _trayBlinkOn = !_trayBlinkOn;
     try {
-      tray.setImage(_trayBlinkOn ? trayAlertImage() : trayNormalImage());
+      // 空白 ↔ 原图标：微信那种闪法
+      tray.setImage(_trayBlinkOn ? nativeImage.createEmpty() : trayNormalImage());
     } catch (err) {
       /* 图标切换失败不影响收信 */
     }
-  }, 600);
+  }, 500);
 }
 
 function stopTrayBlink() {
