@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import secrets
+import select
 import shutil
 import smtplib
 import sqlite3
@@ -5027,7 +5028,8 @@ _POLL_INTERVAL = {
     '126': 180,
     'apple': 300,  # 5 分钟
 }
-_IDLE_NOOP_SEC = 29 * 60  # 29 分钟
+_IDLE_CYCLE_SEC = 4 * 60   # 每次待机 4 分钟就续一次（协议要求 29 分钟内续期，4 分钟更保险）
+_IDLE_MAX_FAILS = 3        # 连续失败这么多次就降级为定时轮询
 _POLL_DEFAULT = 180
 
 _idle_threads = {}       # acc_id -> threading.Thread
@@ -5090,14 +5092,57 @@ def notify_new_mail(acc, folder, uids, baseline=None):
     return True
 
 
+def imap_idle_begin(conn):
+    """发出待机请求，等服务器回 '+ idling'（表示它开始替我们守着了）。"""
+    tag = conn._new_tag()
+    conn.send(tag + b' IDLE' + imaplib.CRLF)
+    while True:
+        line = conn._get_line()
+        if not line:
+            raise RuntimeError('待机请求没有得到回应')
+        if line.startswith(b'+'):
+            return tag
+        if line.startswith(tag):
+            raise RuntimeError('服务器不接受待机：' + line.decode('utf-8', 'replace').strip())
+
+
+def imap_idle_wait(conn, seconds):
+    """安静地等服务器主动推消息；返回 True 表示收到了推送。"""
+    sock = getattr(conn, 'sock', None)
+    if sock is None:
+        raise RuntimeError('连接已断开')
+    try:
+        ready, _w, _x = select.select([sock], [], [], seconds)
+    except Exception:
+        return False
+    if not ready:
+        return False
+    return bool(conn._get_line())      # 例如 b'* 3 EXISTS'
+
+
+def imap_idle_end(conn, tag):
+    """退出待机，并读掉服务器对 DONE 的回应。"""
+    conn.send(b'DONE' + imaplib.CRLF)
+    while True:
+        line = conn._get_line()
+        if not line:
+            raise RuntimeError('退出待机没有得到回应')
+        if line.startswith(tag):
+            return line
+
+
 def _idle_thread_loop(acc):
-    """IMAP IDLE 长连接线程：监控 INBOX，新邮件到达时推送通知。
-    策略：进入 IDLE -> 等待服务器推送或超时 -> DONE 退出 -> 查新 UID -> NOOP 保活 -> 重新 IDLE
+    """IMAP 待机线程：连上之后安静等着，服务器有新邮件会立刻推过来。
+
+    流程：连接 → 打开收件箱 → 待机（最长 _IDLE_CYCLE_SEC）→ 退出待机查新邮件
+          → 在同一条连接上继续待机（不重新连接）。
+    失败按 2/4/8 秒退避重试；连续失败 _IDLE_MAX_FAILS 次就降级成定时轮询。
     """
     aid = acc['id']
-    email = acc.get('email') or ''
+    provider = (acc.get('provider') or '').lower()
     stop_ev = _idle_stop.get(aid)
     conn = None
+    fails = 0
     while stop_ev and not stop_ev.is_set():
         try:
             conn = imap_open(acc, timeout=60)
@@ -5105,34 +5150,23 @@ def _idle_thread_loop(acc):
                 imap_log(acc, 'IDLE select fail', 'INBOX')
                 break
             last_uid = get_last_uid(aid, 'INBOX')
+            tag = imap_idle_begin(conn)
+            fails = 0
             imap_log(acc, 'IDLE start', 'INBOX', 'last_uid', last_uid)
 
             while stop_ev and not stop_ev.is_set():
-                # 进入 IDLE 模式
-                try:
-                    conn.idle()
-                except Exception:
-                    break
-
-                # 等待服务器推送，最长 _IDLE_NOOP_SEC 秒
-                deadline = time.time() + _IDLE_NOOP_SEC
-                while time.time() < deadline:
-                    if stop_ev.is_set():
-                        break
-                    remaining = max(0.5, deadline - time.time())
-                    try:
-                        conn.poll(remaining)
-                    except Exception:
-                        break
-
-                # 退出 IDLE
-                try:
-                    conn.done()
-                except Exception:
-                    pass
-
+                # 安静等服务器来敲门（最长 _IDLE_CYCLE_SEC）
+                pushed = imap_idle_wait(conn, _IDLE_CYCLE_SEC)
+                if pushed:
+                    imap_log(acc, 'IDLE push', 'INBOX')
                 if stop_ev.is_set():
+                    try:
+                        imap_idle_end(conn, tag)
+                    except Exception:
+                        pass
                     break
+                imap_idle_end(conn, tag)
+                fresh = None
 
                 # 退出 IDLE 后查新 UID（比解析 IDLE 响应更可靠）
                 try:
@@ -5150,14 +5184,15 @@ def _idle_thread_loop(acc):
                 except Exception as e:
                     imap_log(acc, 'IDLE fetch err', type(e).__name__, e)
 
-                # NOOP 保活
-                try:
-                    conn.noop()
-                except Exception:
-                    break
+                # 在同一条连接上继续待机（不重新连接）
+                conn.noop()
+                tag = imap_idle_begin(conn)
+                if pushed and not fresh:
+                    stop_ev.wait(0.5)   # 服务器推了消息但没发现新邮件，稍等防空转
 
         except Exception as e:
-            imap_log(acc, 'IDLE error', type(e).__name__, e)
+            fails += 1
+            imap_log(acc, 'IDLE error', type(e).__name__, e, 'fails', fails)
         finally:
             if conn:
                 try:
@@ -5166,8 +5201,24 @@ def _idle_thread_loop(acc):
                     pass
                 conn = None
 
-        if stop_ev and not stop_ev.is_set():
-            stop_ev.wait(10)
+        if not (stop_ev and not stop_ev.is_set()):
+            break
+
+        if fails >= _IDLE_MAX_FAILS:
+            # 服务器不接受待机、或者网络一直不好：降级成定时轮询，别再死磕
+            imap_log(acc, 'IDLE give up -> polling', provider)
+            _POLL_INTERVAL[provider] = 60
+            ev = threading.Event()
+            _poll_stop[aid] = ev
+            t = threading.Thread(target=_poll_thread_loop, args=(acc,), daemon=True,
+                                 name='poll-%s' % aid)
+            _poll_threads[aid] = t
+            t.start()
+            _idle_stop.pop(aid, None)
+            imap_log(acc, 'IDLE stopped', 'INBOX')
+            return
+
+        stop_ev.wait(min(60, 2 ** fails))
     imap_log(acc, 'IDLE stopped', 'INBOX')
 
 
