@@ -4428,9 +4428,9 @@ function bindEvents() {
     if (el.scrollHeight - el.scrollTop - el.clientHeight < 160) loadMoreMails();
   });
 
-  $('overlay').addEventListener('click', (e) => {
-    if (e.target.id === 'overlay') closeCompose();
-  });
+  // 写邮件窗口故意"点背景不关"：以前点一下旁边的地方，写了一半的信就没了。
+  // 现在只有三个出口会关闭它：右上角 × 按钮、存草稿、发送。
+  // （其它弹层——设置、添加账号等——仍然是点背景关闭，不受影响。）
   $('settingsOverlay').addEventListener('click', (e) => {
     if (e.target.id === 'settingsOverlay') closeSettings();
   });
@@ -4478,7 +4478,7 @@ function bindEvents() {
       else closeAccountForm();
     }
     else if (!$('settingsOverlay').hidden) closeSettings();
-    else if (!$('overlay').hidden) closeCompose();
+    // 写邮件窗口也不响应 Esc：避免手一抖把草稿丢了（同上，只用 × / 存草稿 / 发送）
     else if (!$('replyComposer').hidden) hideReply();
   });
   bindSplitter();
