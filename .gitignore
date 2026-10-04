@@ -9,6 +9,7 @@ pupumail.secret
 
 # ===== Python =====
 __pycache__/
+.venv/
 *.pyc
 *.pyo
 *.egg-info/
@@ -25,6 +26,8 @@ electron/dist/
 *.msi
 *.dmg
 *.AppImage
+PuMail-build/
+pumai历代版本/
 
 # ===== 日志与调试 =====
 *.log

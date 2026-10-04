@@ -125,6 +125,31 @@ ipcMain.handle('open-local-page', async (_e, name) => {
   return { ok: true };
 });
 
+// ---------- 任务栏闪烁通知 ----------
+let _flashTimer = null;
+ipcMain.handle('flash-taskbar', async () => {
+  if (!window) return { ok: false };
+  // 如果窗口已经在前台，不需要闪烁
+  if (window.isFocused()) return { ok: true };
+  // 闪烁任务栏图标
+  window.flashFrame(true);
+  // 3 秒后自动停止闪烁
+  if (_flashTimer) clearTimeout(_flashTimer);
+  _flashTimer = setTimeout(() => {
+    if (window) window.flashFrame(false);
+  }, 3000);
+  return { ok: true };
+});
+
+ipcMain.handle('clear-taskbar-flash', async () => {
+  if (_flashTimer) {
+    clearTimeout(_flashTimer);
+    _flashTimer = null;
+  }
+  if (window) window.flashFrame(false);
+  return { ok: true };
+});
+
 app.setAppUserModelId('app.pumail.desktop');
 
 function serverDir() {
@@ -137,10 +162,14 @@ function serverExe() {
 }
 
 function iconFile() {
-  const packed = path.join(process.resourcesPath, 'icon.png');
-  const local = path.join(__dirname, 'build', 'icon.png');
-  if (app.isPackaged && fs.existsSync(packed)) return packed;
-  return local;
+  const packedIco = path.join(process.resourcesPath, 'icon.ico');
+  const localIco = path.join(__dirname, '..', 'cat.ico');
+  const packedPng = path.join(process.resourcesPath, 'icon.png');
+  const localPng = path.join(__dirname, 'build', 'icon.png');
+  if (app.isPackaged && fs.existsSync(packedIco)) return packedIco;
+  if (fs.existsSync(localIco)) return localIco;
+  if (app.isPackaged && fs.existsSync(packedPng)) return packedPng;
+  return localPng;
 }
 
 function appIcon() {

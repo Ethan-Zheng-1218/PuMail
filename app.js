@@ -28,6 +28,8 @@ const state = {
   trEn: new Map(),
   composeAcc: null,
   noticeSound: false,
+  unreadPerAccount: {},
+  pendingUnreadSort: false,
 };
 
 const mailCache = new Map();
@@ -631,9 +633,22 @@ function seedMailCache(accId, folder, pack) {
   });
 }
 
+function applyUnreadSummary(summary) {
+  if (!summary) return;
+  if (summary.per_account) state.unreadPerAccount = summary.per_account;
+  const gaiaFolders = folderCache.get(GAIA_ID);
+  const inbox = gaiaFolders && gaiaFolders.find((f) => f.id === 'INBOX');
+  if (inbox && summary.inbox != null) {
+    inbox.unread_count = Math.max(0, Number(summary.inbox) || 0);
+    inbox.unread = inbox.unread_count > 0;
+  }
+}
+
 function applyBootSeed(boot) {
   if (!boot) return;
   state.accounts = (boot.accounts || []).slice().sort((a, b) => (a.sort_order || a.id) - (b.sort_order || b.id));
+  applyUnreadSummary(boot.unread_summary);
+  if (!boot.unread_summary && boot.unread_per_account) state.unreadPerAccount = boot.unread_per_account || {};
   const seeds = boot.seeds || {};
   Object.keys(seeds).forEach((aid) => {
     const id = Number(aid);
@@ -645,6 +660,7 @@ function applyBootSeed(boot) {
   if (boot.gaia) {
     folderCache.set(GAIA_ID, boot.gaia.folders || []);
     seedMailCache(GAIA_ID, 'INBOX', (boot.gaia.mails || {}).INBOX);
+    applyUnreadSummary(boot.unread_summary);
   }
   renderAccountBar();
   if (!state.accounts.length) return;
@@ -692,6 +708,10 @@ function startNotificationPolling() {
         playNoticeSound();
         const label = n.email ? `${n.email} 收到 ${n.count} 封新邮件` : `收到 ${n.count} 封新邮件`;
         toast(label);
+        // 触发 Windows 任务栏图标闪烁
+        if (window.pumailAPI && window.pumailAPI.flashTaskbar) {
+          window.pumailAPI.flashTaskbar();
+        }
       }
     } catch (err) {
       // 静默忽略，下次轮询再试
@@ -703,8 +723,9 @@ function applyRefreshResult(boot) {
   if (!boot) return;
   if (boot.accounts) {
     state.accounts = (boot.accounts || []).slice().sort((a, b) => (a.sort_order || a.id) - (b.sort_order || b.id));
-    renderAccountBar();
   }
+  applyUnreadSummary(boot.unread_summary);
+  if (!boot.unread_summary && boot.unread_per_account) state.unreadPerAccount = boot.unread_per_account || {};
   const seeds = boot.seeds || {};
   Object.keys(seeds).forEach((aid) => {
     const id = Number(aid);
@@ -716,7 +737,9 @@ function applyRefreshResult(boot) {
   if (boot.gaia) {
     folderCache.set(GAIA_ID, boot.gaia.folders || []);
     seedMailCache(GAIA_ID, 'INBOX', (boot.gaia.mails || {}).INBOX);
+    applyUnreadSummary(boot.unread_summary);
   }
+  renderAccountBar();
   renderFolderNav(folderCache.get(state.acc) || state.folders || []);
   const cached = mailCache.get(mailCacheKey(state.folder, state.q));
   if (cached) paintList(cached);
@@ -728,6 +751,7 @@ function applyRefreshResult(boot) {
 async function refreshAllMail() {
   const btn = $('refreshBtn');
   if (!btn || btn.classList.contains('is-busy')) return;
+  flushDeferredUnreadSort();
   btn.classList.add('is-busy');
   btn.disabled = true;
   try {
@@ -815,6 +839,7 @@ async function switchAccount(id) {
   }
   if (next !== GAIA_ID && !next) return;
   state.listGen += 1;
+  state.pendingUnreadSort = false;
   clearTimeout(state._syncTimer);
   state.acc = next;
   state.goneKeys = new Set();
@@ -836,14 +861,21 @@ function renderAccountBar() {
   if (rail) {
     const shown = state.accounts.slice(0, RAIL_LIMIT);
     rail.innerHTML = shown.length
-      ? shown.map((a) => `
+      ? shown.map((a) => {
+          const unread = state.unreadPerAccount[a.id] || 0;
+          const unreadBadge = unread > 0
+            ? `<span class="acc-unread-badge" title="${unread} 封未读">${unread > 99 ? '99+' : unread}</span>`
+            : '';
+          return `
           <button type="button" class="acc-rail-item ${a.id === state.acc ? 'active' : ''}" data-id="${a.id}">
             <span class="avatar">${esc(nameInitial(a.name, a.email))}</span>
             <span class="acc-rail-meta">
               <strong>${esc(a.name || a.email.split('@')[0])}</strong>
               <small>${esc(a.email)}</small>
             </span>
-          </button>`).join('')
+            ${unreadBadge}
+          </button>`;
+        }).join('')
       : '<p class="acc-rail-empty">未绑定邮箱</p>';
   }
   renderSettingsAccounts();
@@ -1732,6 +1764,7 @@ function applyFolderChrome() {
 }
 
 function paintList(cached) {
+  state.pendingUnreadSort = false;
   state.page = cached.page;
   state.hasMore = cached.hasMore;
   applyFolderChrome();
@@ -1771,10 +1804,12 @@ function syncList(cached) {
   const add = items.filter((m) => !have.has(threadKeyOf(m)));
   if (add.length) renderMailRows(add, { enter: true });
   const list = $('mailList');
-  items.forEach((m) => {
-    const row = findMailRow(list, m);
-    if (row) list.appendChild(row);
-  });
+  if (!state.pendingUnreadSort) {
+    items.forEach((m) => {
+      const row = findMailRow(list, m);
+      if (row) list.appendChild(row);
+    });
+  }
   if (!items.length && !list.querySelector('.mail-row')) {
     list.innerHTML = '<p class="empty-list">没有邮件</p>';
   }
@@ -1862,6 +1897,11 @@ function refreshFolderUnreadFromList() {
   }
   const cached = mailCache.get(mailCacheKey(state.folder, state.q));
   if (!cached) return;
+  // 优先使用服务端返回的未读总数，避免分页加载时缓存不完整导致数字偏小
+  if (cached.unreadCount != null) {
+    setFolderUnread(state.folder, cached.unreadCount > 0, cached.unreadCount);
+    return;
+  }
   const n = cached.items.reduce((sum, m) => sum + (m.unread ? 1 : 0), 0);
   if (state.q && n === 0) return;
   setFolderUnread(state.folder, n > 0, n);
@@ -1873,6 +1913,7 @@ function switchFolder(id) {
     return;
   }
   state.folder = id;
+  state.pendingUnreadSort = false;
   state.goneKeys = new Set();
   closeMessage();
   clearSelection();
@@ -1894,7 +1935,9 @@ async function loadFolders() {
       const d = await api('/api/gaia/folders');
       const folders = d.folders || [];
       folderCache.set(GAIA_ID, folders);
+      applyUnreadSummary(d.unread_summary);
       renderFolderNav(folders);
+      renderAccountBar();
       return;
     }
     const cached = folderCache.get(state.acc);
@@ -1926,6 +1969,7 @@ function showFolderMails(opts = {}) {
 }
 
 async function refreshMails() {
+  flushDeferredUnreadSort();
   invalidateMailCache(state.folder);
   state.page = 0;
   state.hasMore = true;
@@ -1956,6 +2000,8 @@ async function fetchFolderMails(opts = {}) {
       }
     }
     const d = await api((isGaia() ? '/api/gaia/mails?' : '/api/mails?') + params);
+    applyUnreadSummary(d.unread_summary);
+    renderAccountBar();
     if (d.sent_unread != null) applySentUnread(d.sent_unread);
     if (d.sibling_folder && d.sibling_items && d.sibling_items.length
         && !mailCache.has(mailCacheKey(d.sibling_folder, '', acc))) {
@@ -1994,6 +2040,7 @@ async function fetchFolderMails(opts = {}) {
       hasMore: more || !!(opts.merge && prev && prev.hasMore),
       deep: opts.deep || !d.needs_deep,
       filling: !!opts.head,
+      unreadCount: d.unread_count != null ? Number(d.unread_count) : undefined,
     };
     mailCache.set(mailCacheKey(folder, q, acc), cached);
     showSyncErrors(d.errors);
@@ -2080,10 +2127,40 @@ function applyListOrder() {
   if (!cached) return;
   cached.items = sortMailList(cached.items);
   const list = $('mailList');
+  // 保存当前滚动位置和当前激活的行，避免重排后滚动跳动
+  const scrollTop = list.scrollTop;
+  const activeUid = state.current ? String(state.current.uid) : null;
   cached.items.forEach((m) => {
     const row = findMailRow(list, m);
     if (row) list.appendChild(row);
   });
+  // 恢复滚动位置：尝试将之前激活的行保持在视口中
+  if (activeUid) {
+    const activeRow = list.querySelector(`.mail-row[data-uid="${CSS.escape(activeUid)}"]`);
+    if (activeRow) {
+      const rowTop = activeRow.offsetTop;
+      const rowHeight = activeRow.offsetHeight;
+      const listHeight = list.clientHeight;
+      // 如果行在视口上方，滚动到行的位置；如果在视口下方，保持当前滚动
+      if (rowTop < scrollTop) {
+        list.scrollTop = rowTop;
+      } else if (rowTop + rowHeight > scrollTop + listHeight) {
+        list.scrollTop = rowTop + rowHeight - listHeight;
+      } else {
+        list.scrollTop = scrollTop;
+      }
+    } else {
+      list.scrollTop = scrollTop;
+    }
+  } else {
+    list.scrollTop = scrollTop;
+  }
+}
+
+function flushDeferredUnreadSort() {
+  if (!state.pendingUnreadSort) return;
+  state.pendingUnreadSort = false;
+  applyListOrder();
 }
 
 function renderMailRows(items, opts = {}) {
@@ -2186,19 +2263,28 @@ function markMailReadInCaches(accId, uid, key, folder) {
     const cacheIsGaia = cacheAcc === GAIA_ID;
     const cacheIsAcc = Number(cacheAcc) === aid;
     if (!cacheIsGaia && !cacheIsAcc) continue;
+    let flipped = 0;
     cached.items.forEach((m) => {
       if (!mailMatchesReadTarget(m, aid, uid, key)) return;
       if (!m.unread) return;
       m.unread = false;
+      flipped += 1;
       if (cacheIsGaia) flippedGaia += 1;
       if (cacheIsAcc) flippedAcc += 1;
     });
+    if (flipped > 0 && cached.unreadCount != null) {
+      cached.unreadCount = Math.max(0, cached.unreadCount - flipped);
+    }
   }
   const realFolder = folder || 'INBOX';
   if (isGaia()) {
     applyFolderCacheUnreadDelta(aid, realFolder, -(flippedAcc || 1));
   } else {
     applyFolderCacheUnreadDelta(GAIA_ID, gaiaFolderKind(realFolder), -(flippedGaia || 1));
+  }
+  // 同步更新账号红点数字
+  if (state.unreadPerAccount[aid] != null) {
+    state.unreadPerAccount[aid] = Math.max(0, (state.unreadPerAccount[aid] || 0) - (flippedAcc || 1));
   }
 }
 
@@ -2207,9 +2293,11 @@ function markRowRead(uid) {
   const key = row ? row.dataset.key : '';
   const accId = Number((row && row.dataset.acc) || actionAcc());
   const folder = (row && row.dataset.folder) || mailFolder();
+  const wasUnread = !!(row && row.classList.contains('unread'));
   if (row) row.classList.remove('unread');
   markMailReadInCaches(accId, uid, key, folder);
-  applyListOrder();
+  if (wasUnread) state.pendingUnreadSort = true;
+  renderAccountBar();
   refreshFolderUnreadFromList();
 }
 
@@ -2298,6 +2386,10 @@ async function purgeSelected() {
 
 /* ---------- 读信 / 会话 ---------- */
 function openThread(uid, uidsCsv, key, refsCsv, row) {
+  const previous = state.current;
+  if (previous && (previous.thread_key !== key || String(previous.uid) !== String(uid))) {
+    flushDeferredUnreadSort();
+  }
   const cachedHint = (mailCache.get(mailCacheKey(state.folder, state.q)) || { items: [] }).items
     .find((m) => threadKeyOf(m) === key || String(m.uid) === String(uid));
   const folder = (cachedHint && cachedHint.folder) || (row && row.dataset.folder) || mailFolder();
@@ -3809,10 +3901,19 @@ function bumpCurrentRowTime() {
   const item = cached.items.find((m) => threadKeyOf(m) === state.current.thread_key
     || String(m.uid) === String(state.current.uid));
   if (item) {
+    const wasUnread = item.unread;
     item.date = now;
     item.unread = false;
+    if (wasUnread && cached.unreadCount != null) {
+      cached.unreadCount = Math.max(0, cached.unreadCount - 1);
+    }
+    // 同步更新账号红点数字
+    if (wasUnread && state.current.acc && state.unreadPerAccount[state.current.acc] != null) {
+      state.unreadPerAccount[state.current.acc] = Math.max(0, (state.unreadPerAccount[state.current.acc] || 0) - 1);
+    }
     paintList(cached);
     setRowActive(state.current.uid);
+    renderAccountBar();
   }
 }
 

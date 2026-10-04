@@ -2439,7 +2439,7 @@ def boot_folder_unread(acc, folders):
             item['unread'] = bool(starred_unread)
             item['unread_count'] = int(starred_unread or 0)
         elif label == '收件箱':
-            count = unread_map.get('INBOX') or unread_map.get(fid) or 0
+            count = folder_unread_count(acc['id'], 'INBOX')
             item['unread'] = bool(count)
             item['unread_count'] = count
         elif label == '已删除':
@@ -2545,11 +2545,12 @@ def api_boot():
             errors.extend(packed.get('errors') or [])
         for acc in accs:
             _boot_sync_pool.submit(boot_sync_account, acc)
+    first = setting_get(GAIA_FIRST_KEY) != '1'
     gaia = None
     try:
         folders = []
-        first = setting_get(GAIA_FIRST_KEY) != '1'
         for kind, label in (('INBOX', '收件箱'), ('SENT', '已发送'), ('DRAFTS', '草稿')):
+            # 未读数使用与邮件列表相同的时间窗口，确保数字与实际显示一致
             n = gaia_folder_unread(kind, recent_only=not first)
             folders.append({'id': kind, 'label': label, 'unread': n > 0, 'unread_count': n})
         threads = gaia_threads('INBOX', '', recent_only=not first)
@@ -2566,11 +2567,14 @@ def api_boot():
         }
     except Exception as e:
         errors.append(str(e))
+    summary = unread_summary(recent_only=not first)
     return jsonify({
         'accounts': accounts,
         'seeds': seeds,
         'gaia': gaia,
         'errors': errors,
+        'unread_per_account': summary['per_account'],
+        'unread_summary': summary,
     })
 
 
@@ -2652,7 +2656,7 @@ def refresh_account(acc, folder='INBOX'):
 def api_refresh():
     accounts = list_public_accounts()
     if not accounts:
-        return jsonify({'accounts': [], 'seeds': {}, 'gaia': None, 'errors': [], 'new_mail': False, 'new_count': 0})
+        return jsonify({'accounts': [], 'seeds': {}, 'gaia': None, 'errors': [], 'new_mail': False, 'new_count': 0, 'unread_per_account': {}})
     accs = iter_accounts()
     want_id = request.args.get('acc', type=int)
     folder = request.args.get('folder') or 'INBOX'
@@ -2682,12 +2686,13 @@ def api_refresh():
                     errors.extend(packed.get('errors') or [])
             except TimeoutError:
                 pass
+    first = setting_get(GAIA_FIRST_KEY) != '1'
     gaia = None
-    if new_mail and not want_id:
+    if new_mail:
         try:
             folders = []
-            first = setting_get(GAIA_FIRST_KEY) != '1'
             for kind, label in (('INBOX', '收件箱'), ('SENT', '已发送'), ('DRAFTS', '草稿')):
+                # 未读数使用与邮件列表相同的时间窗口，确保数字与实际显示一致
                 n = gaia_folder_unread(kind, recent_only=not first)
                 folders.append({'id': kind, 'label': label, 'unread': n > 0, 'unread_count': n})
             threads = gaia_threads('INBOX', '', recent_only=not first)
@@ -2704,6 +2709,7 @@ def api_refresh():
             }
         except Exception as e:
             errors.append(str(e))
+    summary = unread_summary(recent_only=not first)
     return jsonify({
         'accounts': accounts if new_mail else [],
         'seeds': seeds,
@@ -2711,6 +2717,8 @@ def api_refresh():
         'errors': errors,
         'new_mail': new_mail,
         'new_count': new_count,
+        'unread_per_account': summary['per_account'],
+        'unread_summary': summary,
     })
 
 
@@ -2720,9 +2728,18 @@ def api_gaia_folders():
     recent = not first
     folders = []
     for kind, label in (('INBOX', '收件箱'), ('SENT', '已发送'), ('DRAFTS', '草稿')):
-        n = gaia_folder_unread(kind, recent_only=recent)
+        # 未读数使用与邮件列表相同的时间窗口，确保数字与实际显示一致
+        n = gaia_folder_unread(kind, recent_only=not first)
         folders.append({'id': kind, 'label': label, 'unread': n > 0, 'unread_count': n})
-    return jsonify({'folders': folders, 'first': first})
+    return jsonify({'folders': folders, 'first': first,
+                    'unread_summary': unread_summary(recent_only=recent)})
+
+
+@app.route('/api/gaia/unread-per-account')
+def api_gaia_unread_per_account():
+    """返回每个账号的未读邮件数，用于在侧边栏账号图标上显示红点。"""
+    first = setting_get(GAIA_FIRST_KEY) != '1'
+    return jsonify({'unread': gaia_unread_per_account(recent_only=not first)})
 
 
 @app.route('/api/gaia/mails')
@@ -2745,6 +2762,7 @@ def api_gaia_mails():
     start = 0 if head else (page_no - 1) * PER_PAGE
     take = FIRST_BATCH if head else PER_PAGE
     items = threads[start:start + take]
+    unread_count = gaia_folder_unread(kind, recent_only=not first)
     return jsonify({
         'items': items,
         'total': len(threads),
@@ -2755,6 +2773,8 @@ def api_gaia_mails():
         'first': first,
         'syncing': False,
         'errors': pop_sync_errors(),
+        'unread_count': unread_count,
+        'unread_summary': unread_summary(recent_only=not first),
     })
 
 
@@ -3750,28 +3770,48 @@ def gaia_threads(kind, q='', recent_only=False):
 
 
 def gaia_folder_unread(kind, recent_only=False):
-    cutoff = 0 if not recent_only else time.time() - GAIA_DAYS * 86400
-    total = 0
-    db = get_db()
+    """统计总览中实际显示的未读会话数，而不是会话内邮件总数。"""
+    if kind == 'INBOX':
+        return sum(gaia_unread_per_account(recent_only).values())
+    return unread_thread_count(gaia_threads(kind, recent_only=recent_only), recent_only)
+
+
+def sort_threads_unread_first(threads):
+    return sorted(threads, key=lambda t: (0 if t.get('unread') else 1, -(t.get('ts') or 0)))
+
+
+def unread_thread_count(threads, recent_only=False, limit=None):
+    cutoff = time.time() - GAIA_DAYS * 86400 if recent_only else 0
+    visible = sort_threads_unread_first(threads)
+    if limit is not None:
+        visible = visible[:limit]
+    return sum(1 for thread in visible
+               if thread.get('unread') and (not cutoff or not thread.get('ts') or thread['ts'] >= cutoff))
+
+
+def folder_unread_count(acc_id, folder):
+    """返回当前列表第一页中实际显示的未读会话数。"""
+    acc = get_account(acc_id)
+    return unread_thread_count(threads_from_db(acc, folder), limit=PER_PAGE) if acc else 0
+
+
+def gaia_unread_per_account(recent_only=False):
+    """返回每个账号收件箱中实际显示的未读会话数。"""
+    result = {}
     for acc in iter_accounts():
         if is_demo_account(acc):
             continue
-        folder = gaia_kind_folder(acc, kind)
+        folder = gaia_kind_folder(acc, 'INBOX')
         if not folder:
             continue
-        if cutoff:
-            n = db.execute(
-                """SELECT COUNT(*) FROM mails
-                   WHERE acc_id=? AND folder=? AND unread=1 AND local_deleted=0 AND ts>=?""",
-                (acc['id'], folder, cutoff)).fetchone()[0]
-        else:
-            n = db.execute(
-                """SELECT COUNT(*) FROM mails
-                   WHERE acc_id=? AND folder=? AND unread=1 AND local_deleted=0""",
-                (acc['id'], folder)).fetchone()[0]
-        total += n
-    db.close()
-    return total
+        result[acc['id']] = unread_thread_count(threads_from_db(acc, folder), recent_only, PER_PAGE)
+    return result
+
+
+def unread_summary(recent_only=False):
+    """供所有未读徽标共用的收件箱未读会话汇总。"""
+    per_account = gaia_unread_per_account(recent_only)
+    return {'per_account': per_account, 'inbox': sum(per_account.values())}
 
 
 def fetch_one_body(acc, folder, uid):
@@ -4032,7 +4072,9 @@ def api_folders():
         elif label == '星标':
             item['unread'] = bool(starred_unread)
         elif label == '收件箱':
-            item['unread'] = bool(unread_map.get('INBOX') or unread_map.get(fid))
+            count = folder_unread_count(acc['id'], 'INBOX')
+            item['unread'] = bool(count)
+            item['unread_count'] = count
         elif label == '已删除':
             item['unread'] = False
         else:
@@ -4073,6 +4115,9 @@ def api_mails():
                 and folder in ('INBOX', sent_id)):
             push_sync_error('网易文件夹仍是空的。已写入 IMAP 调试日志，请确认已开 IMAP 并用授权码。')
     threads = threads_from_db(acc, folder, q)
+    # 必须在分页前让未读会话排在前面；否则未读邮件可能落在第 2 页，
+    # 前端即使排序也无法显示它。
+    threads = sort_threads_unread_first(threads)
     imap_log(acc, 'MAILS out', folder, 'db-threads', len(threads), 'sent_id', sent_id or '-')
     start = 0 if head else (page_no - 1) * PER_PAGE
     take = FIRST_BATCH if head else PER_PAGE
@@ -4091,6 +4136,7 @@ def api_mails():
                  and not folder_caught_up(acc['id'], real_folder))
     sibling_folder = sibling_items = None
     background_sync(acc, real_folder if folder != STARRED_ID else 'INBOX')
+    unread_count = folder_unread_count(acc['id'], real_folder)
     return jsonify({
         'items': items,
         'total': len(threads),
@@ -4104,6 +4150,8 @@ def api_mails():
         'sibling_folder': sibling_folder,
         'sibling_items': sibling_items,
         'errors': pop_sync_errors(),
+        'unread_count': unread_count,
+        'unread_summary': unread_summary(),
     })
 
 

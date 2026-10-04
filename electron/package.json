@@ -40,10 +40,14 @@
       {
         "from": "build/icon.png",
         "to": "icon.png"
+      },
+      {
+        "from": "../cat.ico",
+        "to": "icon.ico"
       }
     ],
     "win": {
-      "icon": "build/icon.ico",
+      "icon": "../cat.ico",
       "target": "nsis",
       "signAndEditExecutable": false
     },
@@ -51,13 +55,13 @@
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
+      "createDesktopShortcut": false,
       "createStartMenuShortcut": false,
       "shortcutName": "PuMail",
       "artifactName": "PuMail-Setup.exe",
       "include": "build/installer.nsh",
-      "installerIcon": "build/icon.ico",
-      "uninstallerIcon": "build/icon.ico",
+      "installerIcon": "../cat.ico",
+      "uninstallerIcon": "../cat.ico",
       "installerSidebar": "build/sidebar.bmp",
       "uninstallerSidebar": "build/sidebar.bmp",
       "installerHeader": "build/header.bmp"
