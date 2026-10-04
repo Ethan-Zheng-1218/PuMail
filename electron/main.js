@@ -338,6 +338,8 @@ async function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       preload: path.join(__dirname, 'preload.js'),
+      // 窗口最小化到托盘时不要节流，否则新邮件的轮询会被浏览器降频，声音和闪烁都会延迟
+      backgroundThrottling: false,
     },
   });
   window.loadURL(HOME);

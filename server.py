@@ -2641,6 +2641,9 @@ def refresh_account(acc, folder='INBOX'):
             upsert_headers(acc, real, parsed)
         top = max((uid_int(u) for u in fresh), default=last)
         set_folder_state(acc['id'], real, max(top, last))
+        # 收件箱有新邮件就通知（不管是谁先发现的）
+        if (real or '').upper() == 'INBOX':
+            notify_new_mail(acc, real, fresh, baseline=last)
         imap_log(acc, 'REFRESH new', real, 'count', found['count'], 'parsed', parsed_n, 'ms', int((time.time() - t0) * 1000))
 
     try:
@@ -3642,6 +3645,8 @@ def sync_folder_headers(acc, folder, limit=None, priority=None):
             fetched_low = min((uid_int(u) for u in to_fetch), default=top)
             old = get_oldest_uid(acc['id'], folder)
             set_folder_state(acc['id'], folder, top, oldest_uid=old or fetched_low)
+            if (folder or '').upper() == 'INBOX':
+                notify_new_mail(acc, folder, to_fetch, baseline=last)
 
     with_imap(acc, work, priority=priority)
     # 记下最后一次同步时间，供"新鲜度"判断使用
@@ -5047,6 +5052,44 @@ def _push_notification(acc_id, email, count):
             del _pending_notifications[:-50]
 
 
+# 已经通知过的最大 UID：同一封邮件只提醒一次（刷新和 IDLE 会同时看到它）
+_notified_uid = {}
+
+
+def notify_new_mail(acc, folder, uids, baseline=None):
+    """发现收件箱有新邮件时放一条通知，供前端发声、闪烁。
+
+    任何一条检测路径（刷新、后台同步、IDLE、轮询）都可以调用它；
+    靠 UID 去重，所以同一封邮件不会重复提醒。
+    """
+    if not uids or is_demo_account(acc):
+        return False
+    if (folder or '').upper() != 'INBOX':
+        return False
+    try:
+        max_uid = max(uid_int(u) for u in uids)
+    except Exception:
+        return False
+
+    key = (acc['id'], folder)
+    with _notify_lock:
+        seen = _notified_uid.get(key)
+        if seen is None:
+            seen = uid_int(baseline) if baseline else 0
+            if not seen:
+                # 第一次见到这个账号：只记基线，不通知（避免首次同步历史邮件时炸一堆提醒）
+                _notified_uid[key] = max_uid
+                return False
+        if max_uid <= seen:
+            return False
+        count = len([u for u in uids if uid_int(u) > seen])
+        _notified_uid[key] = max_uid
+
+    _push_notification(acc['id'], acc.get('email') or '', max(1, count))
+    imap_log(acc, 'NOTIFY new', folder, 'count', count)
+    return True
+
+
 def _idle_thread_loop(acc):
     """IMAP IDLE 长连接线程：监控 INBOX，新邮件到达时推送通知。
     策略：进入 IDLE -> 等待服务器推送或超时 -> DONE 退出 -> 查新 UID -> NOOP 保活 -> 重新 IDLE
@@ -5100,8 +5143,9 @@ def _idle_thread_loop(acc):
                             upsert_headers(acc, 'INBOX', parsed)
                             top = max((uid_int(u) for u in fresh), default=last_uid)
                             set_folder_state(aid, 'INBOX', max(top, last_uid))
+                            base = last_uid
                             last_uid = max(top, last_uid)
-                            _push_notification(aid, email, len(fresh))
+                            notify_new_mail(acc, 'INBOX', fresh, baseline=base)
                             imap_log(acc, 'IDLE new', 'INBOX', 'count', len(fresh))
                 except Exception as e:
                     imap_log(acc, 'IDLE fetch err', type(e).__name__, e)
@@ -5148,8 +5192,9 @@ def _poll_thread_loop(acc):
                         upsert_headers(acc, 'INBOX', parsed)
                         top = max((uid_int(u) for u in fresh), default=last_uid)
                         set_folder_state(aid, 'INBOX', max(top, last_uid))
+                        base = last_uid
                         last_uid = max(top, last_uid)
-                        _push_notification(aid, email, len(fresh))
+                        notify_new_mail(acc, 'INBOX', fresh, baseline=base)
                         imap_log(acc, 'POLL new', 'INBOX', 'count', len(fresh))
 
             last_uid = get_last_uid(aid, 'INBOX')
