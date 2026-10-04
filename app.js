@@ -2003,9 +2003,10 @@ async function fetchFolderMails(opts = {}) {
       }
     }
     const d = await api((isGaia() ? '/api/gaia/mails?' : '/api/mails?') + params);
-    // 后端告诉我们这个文件夹正在同步时，中间栏显示"正在同步…"
+    // 后端判断"这个文件夹该不该提示等待"（收件箱有内容可看时不提示）
     if (state.acc === acc && state.folder === folder) {
-      setListSyncing(!!d.syncing, d.syncing ? '正在同步…' : '');
+      const show = d.show_syncing != null ? !!d.show_syncing : !!d.syncing;
+      setListSyncing(show, show ? '正在同步…' : '');
     }
     applyUnreadSummary(d.unread_summary);
     renderAccountBar();
@@ -2061,6 +2062,8 @@ async function fetchFolderMails(opts = {}) {
       }, 1600);
     } else {
       clearTimeout(state._syncTimer);
+      // 重试到上限（或不需要再试）之后就不要一直挂着"正在同步"了
+      if (round >= 3) setListSyncing(false);
     }
     if (state.acc === acc && state.folder === folder && state.q === q && gen === state.listGen) {
       if (opts.append) {

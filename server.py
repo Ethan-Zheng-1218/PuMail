@@ -4182,6 +4182,17 @@ def api_mails():
                  and not folder_caught_up(acc['id'], real_folder))
     sibling_folder = sibling_items = None
     background_sync(acc, real_folder if folder != STARRED_ID else 'INBOX', force=False)
+    # "正在同步"只反映"后台此刻真的在为这个文件夹干活"。
+    # 之前把"数据超过新鲜度"也算进来，而收件箱的新鲜度是 0（每次都刷），
+    # 结果收件箱永远显示"正在同步"，看着像卡住了。
+    with _imap_guard:
+        syncing_now = (f"{acc['id']}|{real_folder}") in _syncing
+    is_inbox = (real_folder or '').upper() == 'INBOX'
+    # syncing 用于前端"稍后再拉一次"（静默更新，不打扰）；
+    # show_syncing 才决定是否给用户看"正在同步…"。
+    # 收件箱每次打开都会后台刷新，但它一直有内容可看，所以不提示；
+    # 其它文件夹只有在"数据旧了"或"后台正在补"时才提示等待。
+    show_syncing = bool(was_empty or head or (not is_inbox and (stale or syncing_now)))
     unread_count = folder_unread_count(acc['id'], real_folder)
     return jsonify({
         'items': items,
@@ -4192,7 +4203,8 @@ def api_mails():
         'has_more': local_more or imap_more,
         'sent_unread': bool(cache_get(f"{acc['id']}|sent_unread")),
         'needs_deep': False,
-        'syncing': was_empty or stale or head,
+        'syncing': was_empty or head or syncing_now,
+        'show_syncing': show_syncing,
         'sibling_folder': sibling_folder,
         'sibling_items': sibling_items,
         'errors': pop_sync_errors(),
