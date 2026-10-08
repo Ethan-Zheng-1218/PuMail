@@ -1,6 +1,6 @@
 {
   "name": "pumail",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "private": true,
   "description": "PuMail desktop shell",
   "main": "main.js",
@@ -17,7 +17,7 @@
     "appId": "app.pumail.desktop",
     "productName": "PuMail",
     "directories": {
-      "output": "../../PuMail-build"
+      "output": "../PuMail-build"
     },
     "files": [
       "main.js",

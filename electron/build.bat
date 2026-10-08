@@ -42,6 +42,6 @@ if errorlevel 1 (
 echo.
 echo ============================================
 echo   Build complete!
-echo   Output: ..\..\PuMail-build\PuMail-Setup.exe
+echo   Output: ..\PuMail-build\PuMail-Setup.exe
 echo ============================================
 pause
