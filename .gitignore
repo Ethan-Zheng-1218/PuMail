@@ -19,6 +19,7 @@ build/
 # ===== Node / Electron =====
 electron/node_modules/
 # electron/build/ 里有打包必需的源文件（installer.nsh、_make_bitmaps.py），不能整目录忽略
+!electron/build/
 electron/build/*
 !electron/build/_make_bitmaps.py
 !electron/build/installer.nsh
