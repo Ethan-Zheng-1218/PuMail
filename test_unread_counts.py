@@ -40,7 +40,7 @@ class UnreadCountTests(unittest.TestCase):
         self.assertEqual(server.gaia_unread_per_account(), {self.google_id: 9, self.qq_id: 4})
         self.assertEqual(server.gaia_folder_unread('INBOX'), 13)
 
-    def test_first_inbox_page_includes_an_unread_conversation_beyond_the_time_page(self):
+    def test_first_inbox_page_is_time_ordered_not_unread_first(self):
         db = server.get_db()
         account_id = db.execute(
             "INSERT INTO accounts(email, name, provider, sort_order, active) VALUES(?,?,?,?,?)",
@@ -65,10 +65,14 @@ class UnreadCountTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         items = response.get_json()['items']
-        self.assertTrue(items[0]['unread'])
-        self.assertEqual(items[0]['uid'], 'old-unread')
+        # 未读不再置顶：第一页就是最新的 30 封，老未读排在它自己的时间位置上。
+        self.assertEqual(len(items), 30)
+        self.assertEqual(items[0]['uid'], '31')
+        self.assertFalse(items[0]['unread'])
+        self.assertFalse(any(item['uid'] == 'old-unread' for item in items))
+        self.assertEqual(server.folder_unread_count(account_id, 'INBOX'), 1)
 
-    def test_account_badge_counts_only_unread_conversations_on_the_first_page(self):
+    def test_account_badge_counts_every_unread_conversation(self):
         db = server.get_db()
         account_id = db.execute(
             "INSERT INTO accounts(email, name, provider, sort_order, active) VALUES(?,?,?,?,?)",
@@ -83,8 +87,8 @@ class UnreadCountTests(unittest.TestCase):
         db.close()
         server.db_save_folders(account_id, [{'id': 'INBOX', 'label': '收件箱'}])
 
-        self.assertEqual(server.folder_unread_count(account_id, 'INBOX'), 30)
-        self.assertEqual(server.gaia_unread_per_account()[account_id], 30)
+        self.assertEqual(server.folder_unread_count(account_id, 'INBOX'), 31)
+        self.assertEqual(server.gaia_unread_per_account()[account_id], 31)
 
 
 if __name__ == '__main__':

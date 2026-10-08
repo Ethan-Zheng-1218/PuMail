@@ -976,6 +976,45 @@ html:not(.theme-light) .refresh-btn img {
   font-size: 14px;
   color: #dfe4ea;
 }
+/* 收信模式下拉 + 收信状态列表 */
+.sync-mode-select {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #3d4451;
+  background: #121212;
+  color: #fff;
+  font: inherit;
+  font-size: 13px;
+}
+.sync-status-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  font-size: 13px;
+  color: #dfe4ea;
+  border-top: 1px solid #2a2f38;
+  padding-top: 10px;
+}
+.sync-status-row:first-child { border-top: none; padding-top: 0; }
+.sync-status-acc { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.sync-status-acc strong { font-weight: 600; }
+.sync-status-acc small { color: #8b95a1; font-size: 12px; }
+.sync-status-mode {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid #3d4451;
+  color: #a4b0be;
+}
+.sync-status-mode.is-idle { color: #6ee7b7; border-color: #2f6f52; }
+.sync-status-mode.is-poll { color: #f0c674; border-color: #6c5a2a; }
+.sync-status-mode.is-manual { color: #a4b0be; }
+.sync-status-err { color: #f28b82; font-size: 12px; }
+html.theme-light .sync-status-row { color: #374151; border-top-color: #e5e7eb; }
+html.theme-light .sync-status-acc small { color: #6b7280; }
+html.theme-light .sync-mode-select { background: #fff; color: #111; border-color: #d1d5db; }
 .toggle-switch {
   position: relative;
   display: inline-block;

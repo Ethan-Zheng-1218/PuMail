@@ -279,6 +279,33 @@
                   </label>
                 </div>
               </div>
+              <div class="settings-card">
+                <div class="toggle-row">
+                  <span class="toggle-label">收信模式</span>
+                  <select id="syncModeSelect" class="sync-mode-select">
+                    <option value="realtime">实时推送</option>
+                    <option value="eco">省电</option>
+                    <option value="manual">手动</option>
+                  </select>
+                </div>
+                <p class="settings-note muted" id="syncModeNote"></p>
+              </div>
+              <div class="settings-card">
+                <div class="toggle-row">
+                  <span class="toggle-label">轮询间隔（163 / 126 / iCloud）</span>
+                  <select id="pollIntervalSelect" class="sync-mode-select">
+                    <option value="60">1 分钟</option>
+                    <option value="120">2 分钟</option>
+                    <option value="300">5 分钟</option>
+                    <option value="600">10 分钟</option>
+                  </select>
+                </div>
+                <p class="settings-note muted">这几个邮箱服务器不支持实时推送，只能定时检查；间隔越短越及时，也越费流量。</p>
+              </div>
+              <div class="settings-card">
+                <p class="settings-kicker">收信状态</p>
+                <div class="settings-stack" id="syncStatusList"><p class="settings-note muted">读取中…</p></div>
+              </div>
             </section>
             <section class="settings-pane" id="pane-account" hidden>
               <div class="settings-pane-head">
@@ -390,7 +417,7 @@
               <div class="about-list">
                 <div class="about-row">
                   <span>版本信息</span>
-                  <span class="about-value">V1.0.0</span>
+                  <span class="about-value">V1.1.1</span>
                 </div>
                 <div class="about-row">
                   <span>用户手册</span>

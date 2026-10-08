@@ -60,7 +60,7 @@ _IMAP_MON = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()
 PORT = int(os.environ.get('PUMAIL_PORT') or 5000)
 BASE_URL = 'http://127.0.0.1:%d' % PORT
 
-from flask import (Flask, abort, jsonify, make_response, request,
+from flask import (Flask, Response, abort, jsonify, make_response, request,
                    send_file, send_from_directory)
 
 def _resource_dir():
@@ -671,6 +671,68 @@ def vault_reset():
     setting_set('vault_wiped', '1')
 
 
+# ---------- 变更事件（SSE）与统计缓存 ----------
+# 收信链路统一从这里对外发布"变化"：新邮件入库、已读/星标变化、邮件编号重置等。
+# 前端用 SSE 长连接订阅 /api/events，收到事件后再拉一次本地数据。
+# 这样提示音和列表用的是同一份事实，不会再出现"响了却没有邮件"。
+_EVENT_HISTORY = 40          # 保留最近多少条事件，够断线重连补发即可
+_events = []
+_event_seq = 0
+_event_cv = threading.Condition()
+_EVENT_KEEPALIVE = 25        # SSE 心跳间隔（秒）
+
+
+def publish(kind, **data):
+    """记录一条变更事件，并唤醒所有正在等待的 SSE 连接。"""
+    global _event_seq
+    with _event_cv:
+        _event_seq += 1
+        event = {'id': _event_seq, 'type': kind, 'ts': time.time()}
+        event.update(data)
+        _events.append(event)
+        del _events[:-_EVENT_HISTORY]
+        _event_cv.notify_all()
+    return event
+
+
+def events_since(since, timeout=0):
+    """取 id 大于 since 的事件；timeout>0 时没有事件就等一小会儿。"""
+    with _event_cv:
+        if timeout:
+            _event_cv.wait(timeout)
+        return [e for e in _events if e['id'] > since]
+
+
+def event_head():
+    with _event_cv:
+        return _event_seq
+
+
+# 未读统计缓存：threads_from_db 要把整个邮箱重新分组成会话，很贵（实测 150ms+），
+# 而 /api/mails、/api/gaia/mails、/api/folders 每个请求都要算一遍。
+_stats_epoch = 0
+_STATS_TTL = 5.0
+_stats_cache = {}
+
+
+def stats_bump():
+    """邮件状态有写入时立刻让统计缓存失效。"""
+    global _stats_epoch
+    _stats_epoch += 1
+    if len(_stats_cache) > 400:
+        _stats_cache.clear()
+
+
+def stats_cached(key, build):
+    now = time.time()
+    hit = _stats_cache.get(key)
+    if hit and hit[0] == _stats_epoch and now - hit[1] < _STATS_TTL:
+        return hit[2]
+    value = build()
+    _stats_cache[key] = (_stats_epoch, now, value)
+    return value
+
+
 # ---------- 数据库 ----------
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
@@ -751,7 +813,8 @@ def init_db():
         oldest_uid INTEGER DEFAULT 0,
         caught_up INTEGER DEFAULT 0,
         PRIMARY KEY (acc_id, folder))""")
-    for col, spec in (('oldest_uid', 'INTEGER DEFAULT 0'), ('caught_up', 'INTEGER DEFAULT 0')):
+    for col, spec in (('oldest_uid', 'INTEGER DEFAULT 0'), ('caught_up', 'INTEGER DEFAULT 0'),
+                      ('uidvalidity', 'INTEGER DEFAULT 0'), ('uidnext', 'INTEGER DEFAULT 0')):
         try:
             db.execute(f'ALTER TABLE folder_state ADD COLUMN {col} {spec}')
         except Exception:
@@ -1537,7 +1600,7 @@ def get_attachments(msg):
 
 
 # ---------- IMAP / SMTP ----------
-IMAP_CLIENT_ID = '("name" "PuMail" "version" "1.0.0" "vendor" "PuMail" "support-email" "pumail@localhost")'
+IMAP_CLIENT_ID = '("name" "PuMail" "version" "1.1.1" "vendor" "PuMail" "support-email" "pumail@localhost")'
 
 
 def needs_imap_id(host):
@@ -1747,6 +1810,84 @@ def imap_exists_count(conn):
     return 0
 
 
+def _imap_int_response(conn, name):
+    """读 SELECT 时服务器给的 UIDVALIDITY / UIDNEXT（读不到就返回 0，绝不猜）。"""
+    try:
+        vals = conn.untagged_responses.get(name) or []
+        if not vals:
+            return 0
+        raw = vals[-1]
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode('ascii', 'ignore')
+        return int(str(raw).strip() or 0)
+    except Exception:
+        return 0
+
+
+def imap_uidvalidity(conn):
+    return _imap_int_response(conn, 'UIDVALIDITY')
+
+
+def imap_uidnext(conn):
+    return _imap_int_response(conn, 'UIDNEXT')
+
+
+def check_uidvalidity(acc, folder, uidv, uidnext=0):
+    """校验邮箱编号（UIDVALIDITY）。
+
+    服务商重置邮箱后所有 UID 会重新编号，本地存的 last_uid 比新邮件还大，
+    "查 last_uid+1 之后的新邮件"就永远查空 —— 表现成这个邮箱静默地收不到信。
+    这里发现编号变化就丢掉该文件夹的本地缓存（本来就是缓存）并重新同步。
+    """
+    if not folder or folder == STARRED_ID or not acc:
+        return False
+    aid = acc['id']
+    db = get_db()
+    try:
+        row = db.execute('SELECT uidvalidity FROM folder_state WHERE acc_id=? AND folder=?',
+                         (aid, folder)).fetchone()
+        old = int(row['uidvalidity']) if row and row['uidvalidity'] else 0
+
+        def store():
+            if row:
+                db.execute('UPDATE folder_state SET uidvalidity=?, uidnext=? WHERE acc_id=? AND folder=?',
+                           (uidv or old, uidnext or 0, aid, folder))
+            else:
+                db.execute(
+                    'INSERT INTO folder_state(acc_id,folder,last_uid,last_sync,oldest_uid,caught_up,uidvalidity,uidnext)'
+                    ' VALUES(?,?,0,?,0,0,?,?)',
+                    (aid, folder, time.time(), uidv or 0, uidnext or 0))
+
+        if not uidv or uidv == old:
+            store()
+            db.commit()
+            return False
+
+        if not old:
+            # 之前没记录过（例如刚升级）：只记下来，不做任何清理。
+            store()
+            db.commit()
+            return False
+
+        dropped = db.execute('DELETE FROM mails WHERE acc_id=? AND folder=?', (aid, folder)).rowcount
+        db.execute('DELETE FROM tombstones WHERE acc_id=? AND folder=?', (aid, folder))
+        db.execute(
+            'UPDATE folder_state SET uidvalidity=?, uidnext=?, last_uid=0, oldest_uid=0, caught_up=0'
+            ' WHERE acc_id=? AND folder=?',
+            (uidv, uidnext or 0, aid, folder))
+        db.commit()
+    finally:
+        db.close()
+
+    imap_log(acc, 'UIDVALIDITY reset', folder, 'old', old, 'new', uidv, 'dropped', dropped)
+    target = '收件箱' if (folder or '').upper() == 'INBOX' else folder
+    push_sync_error('%s 的 %s 编号被服务器重置，已重新同步' % (acc.get('email') or '', target))
+    publish('notice', acc=aid, folder=folder, dropped=dropped,
+            text='邮箱编号被重置，%s 正在重新同步' % target)
+    stats_bump()
+    return True
+
+
 def imap_uids_from_fetch(fetched):
     uids = []
     if not fetched:
@@ -1930,6 +2071,19 @@ def select_folder(conn, folder, readonly=True, acc=None):
                     conn._pumail_mailbox = cand
                 except Exception:
                     pass
+                uidv = imap_uidvalidity(conn)
+                try:
+                    conn._pumail_uidvalidity = uidv
+                except Exception:
+                    pass
+                if acc:
+                    # 服务商重置邮箱编号时，旧的 last_uid 会让"查新邮件"永远查空，
+                    # 表现成这个邮箱再也收不到新邮件——这里必须发现并重新同步。
+                    try:
+                        # 注意用逻辑文件夹名（'INBOX'），不要用线上名（可能是 '"INBOX"'）
+                        check_uidvalidity(acc, folder, uidv, imap_uidnext(conn))
+                    except Exception as e:
+                        imap_log(acc, 'UIDVALIDITY check err', type(e).__name__, e)
                 imap_log(acc, 'SELECT ok', cand, 'exists', exists)
                 return True
             imap_log(acc, 'SELECT no', cand, typ)
@@ -2304,7 +2458,7 @@ def backfill_missing_dates(acc, folder, limit=40):
             return
         upsert_headers(acc, folder, fetch_header_chunk(conn, uids))
 
-    with_imap(acc, work)
+    with_imap(acc, work, priority=sync_queue.PRIORITY_BACKGROUND)
 
 
 def imap_search(conn, q, flagged=False):
@@ -2650,6 +2804,7 @@ def refresh_account(acc, folder='INBOX'):
             upsert_headers(acc, real, parsed)
         top = max((uid_int(u) for u in fresh), default=last)
         set_folder_state(acc['id'], real, max(top, last))
+        announce_new_mail(acc, real, fresh)
         # 收件箱有新邮件就通知（不管是谁先发现的）
         if (real or '').upper() == 'INBOX':
             notify_new_mail(acc, real, fresh, baseline=last)
@@ -2771,11 +2926,13 @@ def api_gaia_mails():
     first = setting_get(GAIA_FIRST_KEY) != '1'
     accs = iter_accounts()
     if accs:
-        workers = min(4, len(accs))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(lambda a: sync_gaia_account(a, kind, first), accs))
         if first:
-            setting_set(GAIA_FIRST_KEY, '1')
+            # 第一次要先把各个邮箱的内容拿回来，这一次只能等
+            run_gaia_scan(kind, first)
+        elif gaia_scan_due(kind):
+            # 平时不在请求里等网络：先把本地数据给用户，扫描放后台，扫完用事件通知界面
+            threading.Thread(target=run_gaia_scan, args=(kind, first), daemon=True,
+                             name='gaia-scan-%s' % kind).start()
     threads = gaia_threads(kind, q, recent_only=not first)
     start = 0 if head else (page_no - 1) * PER_PAGE
     take = FIRST_BATCH if head else PER_PAGE
@@ -3360,6 +3517,8 @@ def upsert_headers(acc, folder, items):
              1 if addr and addr == email else 0, key, (it.get('in_reply_to') or '').strip()))
     db.commit()
     db.close()
+    if items:
+        stats_bump()
 
 
 def save_body(acc_id, folder, uid, data):
@@ -3521,6 +3680,14 @@ def get_last_uid(acc_id, folder):
     return int(row['last_uid']) if row else 0
 
 
+def get_folder_state(acc_id, folder):
+    db = get_db()
+    row = db.execute('SELECT * FROM folder_state WHERE acc_id=? AND folder=?',
+                     (acc_id, folder)).fetchone()
+    db.close()
+    return dict(row) if row else {}
+
+
 def uid_int(u):
     s = u.decode() if isinstance(u, (bytes, bytearray)) else str(u or '')
     digits = ''.join(ch for ch in s if ch.isdigit())
@@ -3654,6 +3821,7 @@ def sync_folder_headers(acc, folder, limit=None, priority=None):
             fetched_low = min((uid_int(u) for u in to_fetch), default=top)
             old = get_oldest_uid(acc['id'], folder)
             set_folder_state(acc['id'], folder, top, oldest_uid=old or fetched_low)
+            announce_new_mail(acc, folder, to_fetch)
             if (folder or '').upper() == 'INBOX':
                 notify_new_mail(acc, folder, to_fetch, baseline=last)
 
@@ -3748,9 +3916,13 @@ def sync_folder_since(acc, folder, days=GAIA_DAYS):
         if uids is None:
             uids = list(reversed(imap_all_uids(conn)))[:FIRST_BATCH]
         last = get_last_uid(acc['id'], folder)
+        fresh = []
         if last:
             newer = [u for u in uids if uid_int(u) > last]
+            fresh = newer
             uids = newer or uids[:20]
+        else:
+            fresh = list(uids)
         for i in range(0, len(uids), HEADER_CHUNK):
             parsed = fetch_header_chunk(conn, uids[i:i + HEADER_CHUNK])
             upsert_headers(acc, folder, parsed)
@@ -3758,6 +3930,10 @@ def sync_folder_since(acc, folder, days=GAIA_DAYS):
             top = max(uid_int(u) for u in uids)
             old = get_oldest_uid(acc['id'], folder)
             set_folder_state(acc['id'], folder, max(top, last or 0), oldest_uid=old)
+        if fresh:
+            announce_new_mail(acc, folder, fresh)
+            if (folder or '').upper() == 'INBOX':
+                notify_new_mail(acc, folder, fresh, baseline=last)
 
     with_imap(acc, work)
 
@@ -3788,6 +3964,36 @@ def sync_gaia_account(acc, kind, first):
         push_sync_error((acc.get('email') or '') + ' 扫描失败：' + str(exc))
 
 
+_gaia_scan_lock = threading.Lock()
+_gaia_scan_at = {}
+
+
+def gaia_scan_due(kind, min_interval=15):
+    """总览扫描节流：15 秒内只扫一次，避免反复点开就反复联网。"""
+    with _gaia_scan_lock:
+        last = _gaia_scan_at.get(kind, 0)
+        if time.time() - last < min_interval:
+            return False
+        _gaia_scan_at[kind] = time.time()
+        return True
+
+
+def run_gaia_scan(kind, first=False):
+    """扫描所有账号的这个文件夹，扫完推一条事件让界面刷新。"""
+    try:
+        accs = iter_accounts()
+        if not accs:
+            return
+        workers = min(4, len(accs))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda a: sync_gaia_account(a, kind, first), accs))
+        if first:
+            setting_set(GAIA_FIRST_KEY, '1')
+        publish('scanned', folder=kind)
+    except Exception as exc:
+        push_sync_error('总览扫描失败：' + str(exc))
+
+
 def gaia_threads(kind, q='', recent_only=False):
     cutoff = time.time() - GAIA_DAYS * 86400 if recent_only else 0
     out = []
@@ -3806,7 +4012,8 @@ def gaia_threads(kind, q='', recent_only=False):
             item['acc_email'] = acc.get('email') or ''
             item['folder'] = t.get('folder') or folder
             out.append(item)
-    out.sort(key=lambda t: (0 if t.get('unread') else 1, -(t.get('ts') or 0)))
+    # 总览按时间倒序排列：未读不再置顶，未读/已读都待在原来的时间位置。
+    out.sort(key=lambda t: -(t.get('ts') or 0))
     return out
 
 
@@ -3817,27 +4024,27 @@ def gaia_folder_unread(kind, recent_only=False):
     return unread_thread_count(gaia_threads(kind, recent_only=recent_only), recent_only)
 
 
-def sort_threads_unread_first(threads):
-    return sorted(threads, key=lambda t: (0 if t.get('unread') else 1, -(t.get('ts') or 0)))
+def sort_threads_by_time(threads):
+    return sorted(threads, key=lambda t: -(t.get('ts') or 0))
 
 
-def unread_thread_count(threads, recent_only=False, limit=None):
+def unread_thread_count(threads, recent_only=False):
+    """统计未读会话数：与列表排序无关，不再只数第一页里的未读。"""
     cutoff = time.time() - GAIA_DAYS * 86400 if recent_only else 0
-    visible = sort_threads_unread_first(threads)
-    if limit is not None:
-        visible = visible[:limit]
-    return sum(1 for thread in visible
+    return sum(1 for thread in threads
                if thread.get('unread') and (not cutoff or not thread.get('ts') or thread['ts'] >= cutoff))
 
 
 def folder_unread_count(acc_id, folder):
-    """返回当前列表第一页中实际显示的未读会话数。"""
-    acc = get_account(acc_id)
-    return unread_thread_count(threads_from_db(acc, folder), limit=PER_PAGE) if acc else 0
+    """返回该文件夹里的未读会话数。"""
+    def build():
+        acc = get_account(acc_id)
+        return unread_thread_count(threads_from_db(acc, folder)) if acc else 0
+    return stats_cached(('folder', acc_id, folder or ''), build)
 
 
 def gaia_unread_per_account(recent_only=False):
-    """返回每个账号收件箱中实际显示的未读会话数。"""
+    """返回每个账号收件箱中的未读会话数。"""
     result = {}
     for acc in iter_accounts():
         if is_demo_account(acc):
@@ -3845,17 +4052,20 @@ def gaia_unread_per_account(recent_only=False):
         folder = gaia_kind_folder(acc, 'INBOX')
         if not folder:
             continue
-        result[acc['id']] = unread_thread_count(threads_from_db(acc, folder), recent_only, PER_PAGE)
+        result[acc['id']] = unread_thread_count(threads_from_db(acc, folder), recent_only)
     return result
 
 
 def unread_summary(recent_only=False):
     """供所有未读徽标共用的收件箱未读会话汇总。"""
-    per_account = gaia_unread_per_account(recent_only)
-    return {'per_account': per_account, 'inbox': sum(per_account.values())}
+    def build():
+        per_account = gaia_unread_per_account(recent_only)
+        return {'per_account': per_account, 'inbox': sum(per_account.values())}
+    return stats_cached(('summary', bool(recent_only)), build)
 
 
-def fetch_one_body(acc, folder, uid):
+def fetch_one_body(acc, folder, uid, priority=None):
+    """抓一封邮件的正文。priority 用来在后台预下载时给用户操作让路。"""
     if is_demo_account(acc):
         row = load_mail_row(acc['id'], folder, uid)
         return row_to_message(row, acc) if row else None
@@ -3894,7 +4104,7 @@ def fetch_one_body(acc, folder, uid):
             save_body(acc['id'], folder, uid, data)
         return data
 
-    return with_imap(acc, work)
+    return with_imap(acc, work, priority=priority)
 
 
 def row_to_message(row, acc):
@@ -3932,6 +4142,7 @@ def mark_local(acc_id, folder, uid, **fields):
     db.execute(f'UPDATE mails SET {sets} WHERE acc_id=? AND folder=? AND uid=?', vals)
     db.commit()
     db.close()
+    stats_bump()
 
 
 def drain_jobs(acc):
@@ -3992,7 +4203,10 @@ def prefetch_unread_bodies(acc, folder, limit=8):
     db.close()
     for r in rows:
         try:
-            fetch_one_body(acc, r['folder'], r['uid'])
+            # 用户正在等某个操作时先让路：这几封正文不值得挡住"打开收件箱"。
+            if sync_queue.worker_for(acc['id']).pending(max_priority=sync_queue.PRIORITY_USER):
+                break
+            fetch_one_body(acc, r['folder'], r['uid'], priority=sync_queue.PRIORITY_BACKGROUND)
         except Exception:
             break
 
@@ -4024,7 +4238,8 @@ def background_sync(acc, folder=None, force=True):
                 # force=True 照旧每次都同步（发信/删除等操作后要立刻刷新）；
                 # 打开文件夹时传 force=False，只有超过新鲜度阈值才真正联网。
                 if force or folder_needs_sync(acc['id'], fol):
-                    sync_folder_headers(acc, fol, limit=FIRST_BATCH)
+                    sync_folder_headers(acc, fol, limit=FIRST_BATCH,
+                                        priority=sync_queue.PRIORITY_BACKGROUND)
                     backfill_missing_dates(acc, fol)
             prefetch_unread_bodies(acc, folder if folder and folder != STARRED_ID else 'INBOX', limit=12)
         except Exception as e:
@@ -4142,28 +4357,25 @@ def api_mails():
         sent_id = resolve_mail_folder(acc['id'], sent_id)
     fresh = request.args.get('fresh') == '1'
     was_empty = not folder_has_mail(acc['id'], real_folder)
-    # 收件箱每次都刷；其它文件夹一天刷一次就够了
-    stale = folder_needs_sync(acc['id'], real_folder)
-    if (was_empty or fresh or stale) and not is_demo_account(acc):
-        imap_log(acc, 'MAILS sync', 'folder', folder, 'empty', was_empty, 'fresh', fresh)
+    needs_sync = (was_empty or fresh or folder_needs_sync(acc['id'], real_folder)) \
+        and not is_demo_account(acc)
+    # 打开文件夹不再等网络：本地有内容就立刻返回，联网同步交给后台线程，
+    # 同步完成后由 /api/events 推一条事件让界面自己补上。
+    # 只有本地完全空（第一次打开这个文件夹）才这一次老老实实等。
+    if needs_sync and folder != STARRED_ID and was_empty:
+        imap_log(acc, 'MAILS blocking sync', 'folder', folder, 'reason', 'empty')
         try:
-            if folder != STARRED_ID:
-                try:
-                    sync_folder_headers(acc, real_folder, limit=FIRST_BATCH)
-                except Exception as e:
-                    imap_log(acc, 'sync folder err', real_folder, e)
-                    push_sync_error('同步失败：' + str(e))
+            sync_folder_headers(acc, real_folder, limit=FIRST_BATCH)
         except Exception as e:
-            imap_log(acc, 'sync err', e)
-            push_sync_error(str(e))
-        if (was_empty and not folder_has_mail(acc['id'], folder)
+            imap_log(acc, 'sync folder err', real_folder, e)
+            push_sync_error('同步失败：' + str(e))
+        if (not folder_has_mail(acc['id'], folder)
                 and needs_imap_id(acc.get('imap_host'))
                 and folder in ('INBOX', sent_id)):
             push_sync_error('网易文件夹仍是空的。已写入 IMAP 调试日志，请确认已开 IMAP 并用授权码。')
     threads = threads_from_db(acc, folder, q)
-    # 必须在分页前让未读会话排在前面；否则未读邮件可能落在第 2 页，
-    # 前端即使排序也无法显示它。
-    threads = sort_threads_unread_first(threads)
+    # 分页前先按时间倒序：列表就是时间顺序，未读不再插队到最前面。
+    threads = sort_threads_by_time(threads)
     imap_log(acc, 'MAILS out', folder, 'db-threads', len(threads), 'sent_id', sent_id or '-')
     start = 0 if head else (page_no - 1) * PER_PAGE
     take = FIRST_BATCH if head else PER_PAGE
@@ -4181,16 +4393,17 @@ def api_mails():
     imap_more = (folder != STARRED_ID and not q and not is_demo_account(acc)
                  and not folder_caught_up(acc['id'], real_folder))
     sibling_folder = sibling_items = None
-    background_sync(acc, real_folder if folder != STARRED_ID else 'INBOX', force=False)
-    # "正在同步"只反映"后台此刻真的在为这个文件夹干活"。
-    # 之前把"数据超过新鲜度"也算进来，而收件箱的新鲜度是 0（每次都刷），
-    # 结果收件箱永远显示"正在同步"，看着像卡住了。
+    # 这里要在启动后台同步之前判断：否则刚加进去的任务会被当成"早就在同步"，
+    # 前端就会因为它永远为真而反复重拉。
     with _imap_guard:
         syncing_now = (f"{acc['id']}|{real_folder}") in _syncing
+    background_sync(acc, real_folder if folder != STARRED_ID else 'INBOX',
+                    force=(fresh or was_empty))
     is_inbox = (real_folder or '').upper() == 'INBOX'
+    stale = needs_sync
     # syncing 用于前端"稍后再拉一次"（静默更新，不打扰）；
     # show_syncing 才决定是否给用户看"正在同步…"。
-    # 收件箱每次打开都会后台刷新，但它一直有内容可看，所以不提示；
+    # 收件箱有内容时后台刷新不提示（列表已经能看）；空的或数据旧了才提示；
     # 其它文件夹只有在"数据旧了"或"后台正在补"时才提示等待。
     show_syncing = bool(was_empty or head or (not is_inbox and (stale or syncing_now)))
     unread_count = folder_unread_count(acc['id'], real_folder)
@@ -4732,7 +4945,9 @@ def setting_set(key, value):
 
 # ---------- 文件夹"新鲜度"（决定打开文件夹时要不要联网同步） ----------
 # 收件箱最重要：打开就刷；其它文件夹（已发送/草稿/垃圾箱…）一般不变，一天刷一次就够。
-INBOX_SYNC_TTL = 0
+# 收件箱的新鲜度：以前是 0（每个请求都联网重拉一遍），现在待机/轮询通道本身
+# 就在盯着新邮件，15 秒内没必要重复联网。真正的新邮件由事件推给界面。
+INBOX_SYNC_TTL = 15
 FOLDER_SYNC_TTL = 24 * 3600
 
 
@@ -4755,7 +4970,7 @@ def mark_folder_synced(acc_id, folder):
 
 
 def folder_needs_sync(acc_id, folder):
-    """超过新鲜度阈值就需要联网同步。收件箱阈值是 0，即每次都刷。"""
+    """超过新鲜度阈值就需要联网同步（收件箱 15 秒，其它文件夹一天）。"""
     ttl = INBOX_SYNC_TTL if (folder or '').upper() == 'INBOX' else FOLDER_SYNC_TTL
     return (time.time() - folder_synced_at(acc_id, folder)) > ttl
 
@@ -4814,7 +5029,18 @@ def _set_registry_autostart(enable):
 def api_general_get():
     return jsonify({
         'notice_sound': setting_get('notice_sound', '0') == '1',
+        'sync_mode': sync_mode(),
+        'poll_interval': poll_interval_setting(),
     })
+
+
+def poll_interval_setting():
+    """163 / 126 / iCloud 的轮询间隔（秒），三个服务商共用一份设置。"""
+    try:
+        value = int(setting_get('poll_interval:163', '') or 0)
+    except Exception:
+        value = 0
+    return value if value > 0 else _POLL_INTERVAL.get('163', _POLL_DEFAULT)
 
 
 @app.route('/api/general', methods=['POST'])
@@ -4825,6 +5051,25 @@ def api_general_set():
         enable = bool(d.get('notice_sound'))
         setting_set('notice_sound', '1' if enable else '0')
         result['notice_sound'] = enable
+    if 'sync_mode' in d:
+        mode = str(d.get('sync_mode') or '').strip().lower()
+        if mode in ('realtime', 'eco', 'manual'):
+            setting_set(_SYNC_MODE_KEY, mode)
+            result['sync_mode'] = mode
+            # 立刻按新模式重启收信线程，不用等下一次对账
+            try:
+                sync_idle_threads()
+            except Exception:
+                pass
+    if 'poll_interval' in d:
+        try:
+            seconds = max(30, min(3600, int(d.get('poll_interval') or 0)))
+        except Exception:
+            seconds = 0
+        if seconds:
+            for provider in ('163', '126', 'icloud'):
+                setting_set('poll_interval:%s' % provider, str(seconds))
+            result['poll_interval'] = seconds
     return jsonify({'ok': True, **result})
 
 
@@ -5040,17 +5285,59 @@ def _quiet_sync_error_logs():
 
 
 # ---------- IMAP IDLE 后台推送 + 通知队列 ----------
-# 支持 IDLE 的服务商：QQ / Gmail / Outlook
-# 兜底轮询的服务商：163 / 126 / Apple
-_IDLE_PROVIDERS = {'qq', 'gmail', 'outlook', 'custom'}
+# 所有邮箱都优先走 IMAP 待机（IDLE）：QQ / Gmail / Outlook / 163 / 126 / iCloud 都支持。
+# 只有 IDLE 连续失败才降级成轮询，并且过一段时间会自动再试着回到 IDLE。
+_IDLE_PROVIDERS = {'qq', 'gmail', 'outlook', 'custom', '163', '126', 'icloud'}
+# 省电模式：只给推送最稳的这几家开待机，其它家拉长轮询间隔
+_ECO_IDLE_PROVIDERS = {'qq', 'gmail', 'outlook', 'custom'}
 _POLL_INTERVAL = {
-    '163': 180,   # 3 分钟
-    '126': 180,
-    'apple': 300,  # 5 分钟
+    '163': 120,
+    '126': 120,
+    'icloud': 120,
 }
 _IDLE_CYCLE_SEC = 4 * 60   # 每次待机 4 分钟就续一次（协议要求 29 分钟内续期，4 分钟更保险）
 _IDLE_MAX_FAILS = 3        # 连续失败这么多次就降级为定时轮询
+_IDLE_RETRY_SEC = 15 * 60  # 降级后每隔这么久再试一次 IDLE（不用重启软件）
 _POLL_DEFAULT = 180
+_POLL_FALLBACK = 60        # 降级后的轮询间隔
+_FLAG_CALIBRATE_SPAN = 60  # 每次醒来校准最近 N 封的已读/星标状态
+_SYNC_MODE_KEY = 'sync_mode'
+
+
+def sync_mode():
+    """收信模式：realtime 实时推送 / eco 省电 / manual 只手动刷新。"""
+    mode = (setting_get(_SYNC_MODE_KEY, 'realtime') or 'realtime').strip().lower()
+    return mode if mode in ('realtime', 'eco', 'manual') else 'realtime'
+
+
+def poll_interval_for(acc):
+    """轮询间隔（秒）：默认值 → 设置里的覆盖值 → 省电模式再拉长。"""
+    provider = (acc.get('provider') or '').lower()
+    interval = _POLL_INTERVAL.get(provider, _POLL_DEFAULT)
+    try:
+        override = int(setting_get('poll_interval:%s' % provider, '') or 0)
+    except Exception:
+        override = 0
+    if override > 0:
+        interval = override
+    if acc['id'] in _poll_fallback_accounts:
+        # 待机失败才改用轮询的账号：查勤快一点，别让收信明显变慢
+        interval = min(interval, _POLL_FALLBACK)
+    if sync_mode() == 'eco':
+        interval *= 3
+    return max(30, interval)
+
+
+_sync_status = {}    # acc_id -> 运行状态（给设置里的"收信状态"用）
+_last_sync_mode = None
+_IDLE_UNSUPPORTED = set()   # 服务器明确拒绝待机的服务商，别再反复重试
+_poll_fallback_accounts = set()
+
+
+def _set_sync_status(acc, **fields):
+    aid = acc['id'] if isinstance(acc, dict) else int(acc)
+    with _notify_lock:
+        _sync_status.setdefault(aid, {}).update(fields)
 
 _idle_threads = {}       # acc_id -> threading.Thread
 _idle_stop = {}          # acc_id -> threading.Event
@@ -5108,8 +5395,23 @@ def notify_new_mail(acc, folder, uids, baseline=None):
         _notified_uid[key] = max_uid
 
     _push_notification(acc['id'], acc.get('email') or '', max(1, count))
+    publish('newmail', acc=acc['id'], email=acc.get('email') or '', folder=folder,
+            count=max(1, count), uids=[str(u) for u in uids][:50])
     imap_log(acc, 'NOTIFY new', folder, 'count', count)
     return True
+
+
+def announce_new_mail(acc, folder, uids):
+    """新邮件头入库后调用：让界面立刻刷新（提示音由 notify_new_mail 负责）。
+
+    与 notify_new_mail 的区别：这里不做"是不是收件箱/是不是比基线新"的判断，
+    任何文件夹只要有新邮件入库都要让列表知道。
+    """
+    if not uids or is_demo_account(acc):
+        return
+    publish('mail', acc=acc['id'], email=acc.get('email') or '',
+            folder=folder or 'INBOX', count=len(uids),
+            last_uid=max((uid_int(u) for u in uids), default=0))
 
 
 def imap_idle_begin(conn):
@@ -5163,6 +5465,7 @@ def _idle_thread_loop(acc):
     stop_ev = _idle_stop.get(aid)
     conn = None
     fails = 0
+    _set_sync_status(acc, mode='idle', alive=True, last_error='')
     while stop_ev and not stop_ev.is_set():
         try:
             conn = imap_open(acc, timeout=60)
@@ -5172,6 +5475,8 @@ def _idle_thread_loop(acc):
             last_uid = get_last_uid(aid, 'INBOX')
             tag = imap_idle_begin(conn)
             fails = 0
+            _poll_fallback_accounts.discard(aid)
+            _set_sync_status(acc, mode='idle', alive=True, last_error='')
             imap_log(acc, 'IDLE start', 'INBOX', 'last_uid', last_uid)
 
             while stop_ev and not stop_ev.is_set():
@@ -5195,6 +5500,7 @@ def _idle_thread_loop(acc):
                         parsed = fetch_header_chunk(conn, fresh)
                         if parsed:
                             upsert_headers(acc, 'INBOX', parsed)
+                            announce_new_mail(acc, 'INBOX', fresh)
                             top = max((uid_int(u) for u in fresh), default=last_uid)
                             set_folder_state(aid, 'INBOX', max(top, last_uid))
                             base = last_uid
@@ -5204,6 +5510,16 @@ def _idle_thread_loop(acc):
                 except Exception as e:
                     imap_log(acc, 'IDLE fetch err', type(e).__name__, e)
 
+                # 校准最近这批邮件的已读/星标，并发现被手机上删掉/归档的邮件。
+                # 每次醒来都做一次，代价很小（一次 SEARCH + 一次批量 FETCH FLAGS）。
+                try:
+                    sync_recent_flags(conn, acc, 'INBOX')
+                    mark_folder_synced(aid, 'INBOX')
+                    _set_sync_status(acc, last_event='检查完成', last_error='')
+                except Exception as e:
+                    imap_log(acc, 'FLAG sync err', type(e).__name__, e)
+                    _set_sync_status(acc, last_error=str(e)[:120])
+
                 # 在同一条连接上继续待机（不重新连接）
                 conn.noop()
                 tag = imap_idle_begin(conn)
@@ -5212,6 +5528,14 @@ def _idle_thread_loop(acc):
 
         except Exception as e:
             fails += 1
+            text = str(e)
+            if '不接受待机' in text or 'not support' in text.lower():
+                # 服务器明确说它不支持 IDLE（例如 163 回 BAD command not support）：
+                # 记下来，别再每 15 分钟重试一轮
+                _IDLE_UNSUPPORTED.add(provider)
+                fails = _IDLE_MAX_FAILS
+                imap_log(acc, 'IDLE unsupported by server', provider, text)
+            _set_sync_status(acc, alive=False, last_error=str(e)[:120])
             imap_log(acc, 'IDLE error', type(e).__name__, e, 'fails', fails)
         finally:
             if conn:
@@ -5227,7 +5551,8 @@ def _idle_thread_loop(acc):
         if fails >= _IDLE_MAX_FAILS:
             # 服务器不接受待机、或者网络一直不好：降级成定时轮询，别再死磕
             imap_log(acc, 'IDLE give up -> polling', provider)
-            _POLL_INTERVAL[provider] = 60
+            _set_sync_status(acc, mode='poll', alive=True, last_event='待机失败，改用轮询')
+            _poll_fallback_accounts.add(aid)
             ev = threading.Event()
             _poll_stop[aid] = ev
             t = threading.Thread(target=_poll_thread_loop, args=(acc,), daemon=True,
@@ -5235,6 +5560,9 @@ def _idle_thread_loop(acc):
             _poll_threads[aid] = t
             t.start()
             _idle_stop.pop(aid, None)
+            if provider not in _IDLE_UNSUPPORTED:
+                threading.Thread(target=_retry_idle_later, args=(acc,), daemon=True,
+                                 name='idle-retry-%s' % aid).start()
             imap_log(acc, 'IDLE stopped', 'INBOX')
             return
 
@@ -5243,14 +5571,15 @@ def _idle_thread_loop(acc):
 
 
 def _poll_thread_loop(acc):
-    """轮询线程：对不支持 IDLE 的服务商定时检查新邮件。"""
+    """轮询线程：兜底通道（IDLE 失败的账号、或省电模式下的账号）。"""
     aid = acc['id']
     email = acc.get('email') or ''
     provider = (acc.get('provider') or '').lower()
-    interval = _POLL_INTERVAL.get(provider, _POLL_DEFAULT)
     stop_ev = _poll_stop.get(aid)
+    _set_sync_status(acc, mode='poll', alive=True)
 
     while stop_ev and not stop_ev.is_set():
+        interval = poll_interval_for(acc)     # 每轮都读一次，改了设置马上生效
         try:
             def work(conn):
                 nonlocal last_uid
@@ -5261,25 +5590,133 @@ def _poll_thread_loop(acc):
                     parsed = fetch_header_chunk(conn, fresh)
                     if parsed:
                         upsert_headers(acc, 'INBOX', parsed)
+                        announce_new_mail(acc, 'INBOX', fresh)
                         top = max((uid_int(u) for u in fresh), default=last_uid)
                         set_folder_state(aid, 'INBOX', max(top, last_uid))
                         base = last_uid
                         last_uid = max(top, last_uid)
                         notify_new_mail(acc, 'INBOX', fresh, baseline=base)
                         imap_log(acc, 'POLL new', 'INBOX', 'count', len(fresh))
+                sync_recent_flags(conn, acc, 'INBOX')
 
             last_uid = get_last_uid(aid, 'INBOX')
             with_imap(acc, work, ping=True, retry=True, timeout=15)
+            mark_folder_synced(aid, 'INBOX')
+            _set_sync_status(acc, alive=True, last_event='轮询检查完成', last_error='')
         except Exception as e:
             imap_log(acc, 'POLL error', type(e).__name__, e)
+            _set_sync_status(acc, alive=False, last_error=str(e)[:120])
 
         if stop_ev:
             stop_ev.wait(interval)
     imap_log(acc, 'POLL stopped', 'INBOX')
 
 
+def _retry_idle_later(acc):
+    """降级成轮询之后，过一段时间再试着回到 IDLE（不必重启软件）。"""
+    aid = acc['id']
+    ev = _poll_stop.get(aid) or threading.Event()
+    if ev.wait(_IDLE_RETRY_SEC):
+        return                      # 应用退出或账号被移除
+    with _imap_guard:
+        still_polling = aid in _poll_threads and aid not in _idle_threads
+    if not still_polling:
+        return
+    imap_log(acc, 'IDLE retry', 'INBOX')
+    _start_idle_for_account(acc)
+
+
+def sync_recent_flags(conn, acc, folder='INBOX', span=_FLAG_CALIBRATE_SPAN):
+    """校准最近一批邮件的已读/星标，并发现被其它设备删掉/移走的邮件。
+
+    为什么需要它：IDLE 只告诉我们"服务器有变化"，而手机端读信/删信属于
+    FLAGS/EXPUNGE 变化。这里用一次 SEARCH + 一次批量 FETCH FLAGS 把最近
+    span 封的状态对齐，所以手机上读掉的信，电脑上的小红点也会跟着消失。
+    """
+    aid = acc['id']
+    if not folder or folder == STARRED_ID:
+        return 0
+    db = get_db()
+    rows = db.execute(
+        'SELECT uid, unread, starred, pending_sync FROM mails'
+        ' WHERE acc_id=? AND folder=? AND local_deleted=0', (aid, folder)).fetchall()
+    db.close()
+    local = {}
+    for r in rows:
+        u = uid_int(r['uid'])
+        if u:
+            local[u] = r
+    if not local:
+        return 0
+    hi = max(local)
+    lo = max(1, hi - max(10, int(span)))
+    wanted = {u: r for u, r in local.items() if u >= lo}
+    if not wanted:
+        return 0
+
+    uid_list = sorted(wanted)
+    flags = {}
+    complete = True
+    try:
+        for i in range(0, len(uid_list), HEADER_CHUNK):
+            chunk = uid_list[i:i + HEADER_CHUNK]
+            typ, data = conn.uid('fetch', ','.join(str(u) for u in chunk).encode(), '(FLAGS)')
+            if typ != 'OK' or not data:
+                complete = False
+                continue
+            for part in data:
+                if not isinstance(part, tuple) or len(part) < 2:
+                    continue
+                meta = part[0] if isinstance(part[0], bytes) else b''
+                m = re.search(br'UID\s+(\d+)', meta)
+                if not m:
+                    continue
+                u = int(m.group(1))
+                flags[u] = (b'\\Seen' not in meta, b'\\Flagged' in meta)
+    except Exception as e:
+        imap_log(acc, 'FLAG calibrate err', type(e).__name__, e)
+        return 0
+    if not flags:
+        return 0
+
+    changed = 0
+    missing = []
+    for u, r in wanted.items():
+        if r['pending_sync']:
+            continue                 # 本地有还没推上去的改动，不要被覆盖
+        if u not in flags:
+            if complete:
+                missing.append(str(u))
+            continue
+        unread, starred = flags[u]
+        if bool(r['unread']) == unread and bool(r['starred']) == starred:
+            continue
+        db = get_db()
+        db.execute('UPDATE mails SET unread=?, starred=? WHERE acc_id=? AND folder=? AND uid=?',
+                   (1 if unread else 0, 1 if starred else 0, aid, folder, str(u)))
+        db.commit()
+        db.close()
+        changed += 1
+
+    if missing:
+        db = get_db()
+        for u in missing:
+            db.execute('UPDATE mails SET local_deleted=1, unread=0 WHERE acc_id=? AND folder=? AND uid=?',
+                       (aid, folder, u))
+        db.commit()
+        db.close()
+        changed += len(missing)
+
+    if changed:
+        stats_bump()
+        publish('flags', acc=aid, email=acc.get('email') or '', folder=folder,
+                count=changed, gone=len(missing))
+        imap_log(acc, 'FLAG changed', folder, 'count', changed, 'gone', len(missing))
+    return changed
+
+
 def _start_idle_for_account(acc):
-    """为单个账号启动 IDLE 或轮询线程。"""
+    """为单个账号启动 IDLE 或轮询线程（按收信模式决定）。"""
     aid = acc['id']
     provider = (acc.get('provider') or '').lower()
     if is_demo_account(acc):
@@ -5288,9 +5725,18 @@ def _start_idle_for_account(acc):
     # 先停止已有的线程
     _stop_idle_for_account(aid)
 
-    if provider in _IDLE_PROVIDERS:
+    mode = sync_mode()
+    if mode == 'manual':
+        _set_sync_status(acc, mode='manual', alive=False, last_event='手动模式：不后台收信')
+        imap_log(acc, 'SYNC manual mode', 'INBOX')
+        return
+
+    idle_ok = (provider in (_IDLE_PROVIDERS if mode == 'realtime' else _ECO_IDLE_PROVIDERS)
+               and provider not in _IDLE_UNSUPPORTED)
+    if idle_ok:
         ev = threading.Event()
         _idle_stop[aid] = ev
+        _set_sync_status(acc, mode='idle', alive=True, last_event='正在等待服务器推送')
         t = threading.Thread(target=_idle_thread_loop, args=(acc,), daemon=True, name=f'idle-{aid}')
         _idle_threads[aid] = t
         t.start()
@@ -5298,10 +5744,11 @@ def _start_idle_for_account(acc):
     else:
         ev = threading.Event()
         _poll_stop[aid] = ev
+        _set_sync_status(acc, mode='poll', alive=True, last_event='定时检查中')
         t = threading.Thread(target=_poll_thread_loop, args=(acc,), daemon=True, name=f'poll-{aid}')
         _poll_threads[aid] = t
         t.start()
-        imap_log(acc, 'POLL thread started', 'INBOX', 'interval', _POLL_INTERVAL.get(provider, _POLL_DEFAULT))
+        imap_log(acc, 'POLL thread started', 'INBOX', 'interval', poll_interval_for(acc))
 
 
 def _stop_idle_for_account(aid):
@@ -5328,11 +5775,22 @@ def sync_idle_threads():
     except Exception:
         return
     active_ids = {acc['id'] for acc in accounts if not is_demo_account(acc)}
+    global _last_sync_mode
+    mode = sync_mode()
+    mode_changed = _last_sync_mode is not None and _last_sync_mode != mode
+    _last_sync_mode = mode
 
     # 停止已删除账号的线程
     for aid in list(_idle_threads.keys()) + list(_poll_threads.keys()):
         if aid not in active_ids:
             _stop_idle_for_account(aid)
+
+    # 收信模式变了（实时/省电/手动）：所有账号按新模式重启一遍
+    if mode_changed:
+        for acc in accounts:
+            if not is_demo_account(acc):
+                _start_idle_for_account(acc)
+        return
 
     # 为新账号启动线程
     for acc in accounts:
@@ -5348,10 +5806,36 @@ def stop_all_idle_threads():
         _stop_idle_for_account(aid)
 
 
+def _sync_watcher_loop():
+    """每 30 秒对一次账：新模式、新账号、被删掉的账号都能自动跟上。"""
+    while not _idle_manager_stop.is_set():
+        try:
+            sync_idle_threads()
+        except Exception:
+            pass
+        _idle_manager_stop.wait(30)
+
+
+def start_sync_watcher():
+    global _idle_manager_thread
+    if _idle_manager_thread and _idle_manager_thread.is_alive():
+        return
+    _idle_manager_thread = threading.Thread(target=_sync_watcher_loop, daemon=True,
+                                            name='sync-watcher')
+    _idle_manager_thread.start()
+
+
 @app.route('/api/ping')
 def api_ping():
     """给 Electron 外壳用来确认"这个端口对面是不是我们自己的后端"。"""
     return jsonify({'app': 'pumail', 'pid': os.getpid(), 'port': PORT})
+
+
+@app.route('/api/unread')
+def api_unread():
+    """只取未读汇总（带缓存），供事件到达后刷新徽标用。"""
+    # 总览按 10 天窗口统计，单个邮箱按全部未读统计，两边各自保持一致
+    return jsonify({'all': unread_summary(False), 'recent': unread_summary(True)})
 
 
 @app.route('/api/notifications')
@@ -5361,6 +5845,67 @@ def api_notifications():
         out = _pending_notifications[:]
         _pending_notifications.clear()
     return jsonify({'notifications': out})
+
+
+@app.route('/api/events')
+def api_events():
+    """SSE 长连接：把"邮件/状态变化"实时推给界面。
+
+    事件只负责"告诉界面有变化"，界面收到后再拉一次本地数据。
+    since=0 表示只订阅从现在开始的事件（不补发历史，避免重连时重复提醒）。
+    """
+    try:
+        since = int(request.args.get('since') or 0)
+    except Exception:
+        since = 0
+    if since <= 0:
+        since = event_head()
+
+    def stream():
+        yield 'retry: 3000\n\n'
+        cursor = since
+        while True:
+            pending = events_since(cursor, timeout=_EVENT_KEEPALIVE)
+            if not pending:
+                yield ': ping\n\n'
+                continue
+            for event in pending:
+                cursor = event['id']
+                yield 'id: %d\ndata: %s\n\n' % (event['id'], json.dumps(event, ensure_ascii=False))
+
+    return Response(stream(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+@app.route('/api/sync-status')
+def api_sync_status():
+    """每个账号当前怎么收信、上次同步时间、最近一次错误。"""
+    accounts = []
+    now = time.time()
+    for acc in iter_accounts():
+        if is_demo_account(acc):
+            continue
+        aid = acc['id']
+        live = _sync_status.get(aid) or {}
+        last_sync = folder_synced_at(aid, 'INBOX')
+        state = get_folder_state(aid, 'INBOX')
+        accounts.append({
+            'id': aid,
+            'email': acc.get('email') or '',
+            'provider': acc.get('provider') or '',
+            'mode': live.get('mode') or ('poll' if aid in _poll_threads else 'idle' if aid in _idle_threads else 'off'),
+            'thread_alive': bool(live.get('alive')),
+            'last_sync': last_sync,
+            'last_sync_ago': int(now - last_sync) if last_sync else None,
+            'last_event': live.get('last_event') or '',
+            'last_error': live.get('last_error') or '',
+            'poll_interval': poll_interval_for(acc) if aid not in _idle_threads else 0,
+            'uidvalidity': int(state.get('uidvalidity') or 0),
+            'uidnext': int(state.get('uidnext') or 0),
+            'last_uid': int(state.get('last_uid') or 0),
+            'unread': folder_unread_count(aid, 'INBOX'),
+        })
+    return jsonify({'mode': sync_mode(), 'accounts': accounts})
 
 
 _quiet_sync_error_logs()
@@ -5376,5 +5921,6 @@ if __name__ == '__main__':
     import atexit
     atexit.register(stop_all_idle_threads)
     sync_idle_threads()
+    start_sync_watcher()
 
     app.run(host='127.0.0.1', port=PORT, debug=False)

@@ -29,7 +29,6 @@ const state = {
   composeAcc: null,
   noticeSound: false,
   unreadPerAccount: {},
-  pendingUnreadSort: false,
 };
 
 const mailCache = new Map();
@@ -513,7 +512,12 @@ function normKey(s) {
 }
 
 function threadKeyOf(item) {
-  return normKey(item && item.thread_key) || String(item && item.uid || '');
+  const key = normKey(item && item.thread_key) || String((item && item.uid) || '');
+  if (!key) return '';
+  // 总览会把多个邮箱的邮件放在同一个列表里，不同邮箱的同一主题只是"同名"，
+  // 不能当成同一封信：带上账号，避免列表里互相覆盖（未读被已读顶掉）。
+  const acc = item && item.acc != null && item.acc !== '' ? String(item.acc) : '';
+  return acc ? `${acc}|${key}` : key;
 }
 
 const OTP_SUBJ = /一次性\s*[代验認认]?[码碼]|验证码|驗證碼|校验码|校驗碼|动态码|動態碼|安全代码|安全代碼|verification\s*code|security\s*code|one[-\s]?time\s+(?:code|password|passcode)|\botp\b|(?:your|google|microsoft|apple)\s+(?:verification\s+|security\s+)?code/i;
@@ -705,18 +709,128 @@ function startNotificationPolling() {
       const d = await api('/api/notifications');
       const notes = d.notifications || [];
       for (const n of notes) {
-        playNoticeSound();
-        const label = n.email ? `${n.email} 收到 ${n.count} 封新邮件` : `收到 ${n.count} 封新邮件`;
-        toast(label);
-        // 触发 Windows 任务栏图标闪烁
-        if (window.pumailAPI && window.pumailAPI.flashTaskbar) {
-          window.pumailAPI.flashTaskbar();
-        }
+        // SSE 连着的时候由事件负责响铃，这里只负责清空队列，避免响两次
+        if (!_eventOk) handleNewMailNotice(n);
       }
     } catch (err) {
       // 静默忽略，下次轮询再试
     }
   }, 3000);
+}
+
+// ---------- 收信事件（SSE） ----------
+// 后端每写完一封邮件、或改了已读状态，就推一条事件过来；
+// 界面收到后自己把列表和徽标补上 —— 这样"响了却看不到邮件"不会再发生。
+let _eventSource = null;
+let _eventLastId = 0;
+let _eventReconnectTimer = null;
+let _eventOk = false;
+let _badgeRefreshTimer = null;
+
+function handleNewMailNotice(n) {
+  playNoticeSound();
+  const label = n.email ? `${n.email} 收到 ${n.count} 封新邮件` : `收到 ${n.count} 封新邮件`;
+  toast(label);
+  // 触发 Windows 任务栏图标闪烁
+  if (window.pumailAPI && window.pumailAPI.flashTaskbar) {
+    window.pumailAPI.flashTaskbar();
+  }
+}
+
+function scheduleBadgeRefresh() {
+  if (_badgeRefreshTimer) return;
+  _badgeRefreshTimer = setTimeout(async () => {
+    _badgeRefreshTimer = null;
+    try {
+      const pack = await api('/api/unread');
+      applyUnreadSummary((isGaia() ? pack.recent : pack.all) || pack.all);
+    } catch (err) {
+      // 下次事件再补
+    }
+    renderAccountBar();
+  }, 250);
+}
+
+function refreshListFromEvent(accId, folder) {
+  if (!state.acc) return;
+  const gaia = isGaia();
+  const visible = gaia
+    ? (!folder || state.folder === folder)
+    : (Number(state.acc) === Number(accId) && (!folder || state.folder === folder));
+  if (!visible) return;
+  // 本地库已经写好，这里只是重新读一次本地数据，增量合并进当前列表，不整页重绘
+  fetchFolderMails({ background: true, merge: true });
+}
+
+function handleServerEvent(ev) {
+  if (!ev) return;
+  if (ev.type === 'newmail') {
+    handleNewMailNotice(ev);
+    return;
+  }
+  if (ev.type === 'notice') {
+    if (ev.text) toast(ev.text);
+    scheduleBadgeRefresh();
+    return;
+  }
+  if (ev.type === 'mail' || ev.type === 'flags') {
+    scheduleBadgeRefresh();
+    refreshListFromEvent(ev.acc, ev.folder);
+    return;
+  }
+  if (ev.type === 'scanned') {
+    // 总览的后台扫描落地了：徽标 + 当前总览列表跟上
+    scheduleBadgeRefresh();
+    if (isGaia() && (!ev.folder || state.folder === ev.folder)) {
+      fetchFolderMails({ background: true, merge: true });
+    }
+  }
+}
+
+function closeEventStream() {
+  if (_eventSource) {
+    try { _eventSource.close(); } catch (err) { /* ignore */ }
+    _eventSource = null;
+  }
+  _eventOk = false;
+}
+
+function scheduleEventReconnect() {
+  if (_eventReconnectTimer) return;
+  _eventReconnectTimer = setTimeout(() => {
+    _eventReconnectTimer = null;
+    connectEventStream();
+  }, 4000);
+}
+
+function connectEventStream() {
+  if (!window.EventSource) return;
+  closeEventStream();
+  try {
+    _eventSource = new EventSource('/api/events?since=' + (_eventLastId || 0));
+  } catch (err) {
+    scheduleEventReconnect();
+    return;
+  }
+  _eventSource.onopen = () => { _eventOk = true; };
+  _eventSource.onerror = () => {
+    // EventSource 自己也会重连，但我们自己接管更可控（用最后处理过的事件 id）
+    _eventOk = false;
+    closeEventStream();
+    scheduleEventReconnect();
+  };
+  _eventSource.onmessage = (raw) => {
+    let data = null;
+    try {
+      data = JSON.parse(raw.data);
+    } catch (err) {
+      return;
+    }
+    if (!data || typeof data.id !== 'number') return;
+    if (data.id <= _eventLastId) return;   // 重连补发的重复事件
+    _eventLastId = data.id;
+    handleServerEvent(data);
+  };
 }
 
 function applyRefreshResult(boot) {
@@ -751,7 +865,6 @@ function applyRefreshResult(boot) {
 async function refreshAllMail() {
   const btn = $('refreshBtn');
   if (!btn || btn.classList.contains('is-busy')) return;
-  flushDeferredUnreadSort();
   btn.classList.add('is-busy');
   btn.disabled = true;
   try {
@@ -789,6 +902,7 @@ async function startApp() {
   loadTranslatePrefs();
   loadGeneralPrefs();
   startNotificationPolling();
+  connectEventStream();
   let boot = null;
   const bootPromise = api('/api/boot').then((d) => {
     boot = d;
@@ -839,7 +953,6 @@ async function switchAccount(id) {
   }
   if (next !== GAIA_ID && !next) return;
   state.listGen += 1;
-  state.pendingUnreadSort = false;
   clearTimeout(state._syncTimer);
   state.acc = next;
   state.goneKeys = new Set();
@@ -1096,9 +1209,18 @@ async function loadGeneralSettings() {
     const d = await api('/api/general');
     const soundToggle = $('noticeSoundToggle');
     if (soundToggle) soundToggle.checked = !!d.notice_sound;
+    const modeSel = $('syncModeSelect');
+    if (modeSel && d.sync_mode) modeSel.value = d.sync_mode;
+    const pollSel = $('pollIntervalSelect');
+    if (pollSel && d.poll_interval) {
+      const want = String(d.poll_interval);
+      if ([...pollSel.options].some((o) => o.value === want)) pollSel.value = want;
+    }
+    paintSyncModeNote();
   } catch (err) {
     // ignore
   }
+  loadSyncStatus();
   // 开机自启动由 Electron 管理，通过 IPC 读取
   try {
     const toggle = $('autoStartToggle');
@@ -1137,6 +1259,84 @@ $('noticeSoundToggle').addEventListener('change', async (e) => {
     toast('设置失败：' + err.message);
   }
 });
+
+/* ---------- 收信模式 / 收信状态 ---------- */
+const SYNC_MODE_TEXT = {
+  realtime: '所有邮箱都用 IMAP 待机：服务器一有新邮件立刻推给电脑，最及时。',
+  eco: 'QQ / Gmail / Outlook 保持实时；163 / 126 / iCloud 改成定时检查（间隔更长），省一点电。',
+  manual: '不在后台收信：只有点右上角刷新、或打开文件夹时才会联网取信。',
+};
+
+function paintSyncModeNote() {
+  const el = $('syncModeNote');
+  const sel = $('syncModeSelect');
+  if (el && sel) el.textContent = SYNC_MODE_TEXT[sel.value] || '';
+}
+
+async function loadSyncStatus() {
+  const box = $('syncStatusList');
+  if (!box) return;
+  try {
+    const d = await api('/api/sync-status');
+    const accounts = d.accounts || [];
+    if (!accounts.length) {
+      box.innerHTML = '<p class="settings-note muted">还没有绑定邮箱。</p>';
+      return;
+    }
+    box.innerHTML = accounts.map((a) => {
+      const modeText = a.mode === 'idle' ? '实时待机'
+        : a.mode === 'poll' ? '定时检查'
+          : a.mode === 'manual' ? '手动' : '未启动';
+      const cls = a.mode === 'idle' ? 'is-idle' : a.mode === 'poll' ? 'is-poll' : 'is-manual';
+      const ago = a.last_sync_ago == null
+        ? '还没同步过'
+        : (a.last_sync_ago < 90 ? `${a.last_sync_ago} 秒前同步` : `${Math.round(a.last_sync_ago / 60)} 分钟前同步`);
+      const wait = a.mode === 'poll' && a.poll_interval
+        ? `每 ${a.poll_interval} 秒检查一次`
+        : (a.mode === 'idle' ? (a.thread_alive ? '等待服务器推送' : '连接重建中') : (a.last_event || ''));
+      const err = a.last_error ? `<small class="sync-status-err">最近错误：${esc(a.last_error)}</small>` : '';
+      return `
+        <div class="sync-status-row">
+          <div class="sync-status-acc">
+            <strong>${esc(a.email)}</strong>
+            <small>${esc(ago)} · ${esc(wait)}</small>
+            ${err}
+          </div>
+          <span class="sync-status-mode ${cls}">${modeText}</span>
+        </div>`;
+    }).join('');
+  } catch (err) {
+    box.innerHTML = `<p class="settings-note muted">读取失败：${esc(err.message || '')}</p>`;
+  }
+}
+
+if ($('syncModeSelect')) {
+  $('syncModeSelect').addEventListener('change', async (e) => {
+    const mode = e.target.value;
+    try {
+      await api('/api/general', { method: 'POST', body: { sync_mode: mode } });
+      paintSyncModeNote();
+      toast(mode === 'manual' ? '已切换为手动收信'
+        : mode === 'eco' ? '已切换为省电模式' : '已切换为实时推送');
+      setTimeout(loadSyncStatus, 900);
+    } catch (err) {
+      toast('设置失败：' + err.message);
+    }
+  });
+}
+
+if ($('pollIntervalSelect')) {
+  $('pollIntervalSelect').addEventListener('change', async (e) => {
+    const seconds = Number(e.target.value) || 120;
+    try {
+      await api('/api/general', { method: 'POST', body: { poll_interval: seconds } });
+      toast(`163 / 126 / iCloud 改为每 ${seconds >= 60 ? Math.round(seconds / 60) + ' 分钟' : seconds + ' 秒'}检查一次`);
+      setTimeout(loadSyncStatus, 900);
+    } catch (err) {
+      toast('设置失败：' + err.message);
+    }
+  });
+}
 
 async function openStorageLocation() {
   const btn = $('storageOpenBtn');
@@ -1764,7 +1964,6 @@ function applyFolderChrome() {
 }
 
 function paintList(cached) {
-  state.pendingUnreadSort = false;
   state.page = cached.page;
   state.hasMore = cached.hasMore;
   applyFolderChrome();
@@ -1804,12 +2003,10 @@ function syncList(cached) {
   const add = items.filter((m) => !have.has(threadKeyOf(m)));
   if (add.length) renderMailRows(add, { enter: true });
   const list = $('mailList');
-  if (!state.pendingUnreadSort) {
-    items.forEach((m) => {
-      const row = findMailRow(list, m);
-      if (row) list.appendChild(row);
-    });
-  }
+  items.forEach((m) => {
+    const row = findMailRow(list, m);
+    if (row) list.appendChild(row);
+  });
   if (!items.length && !list.querySelector('.mail-row')) {
     list.innerHTML = '<p class="empty-list">没有邮件</p>';
   }
@@ -1913,7 +2110,6 @@ function switchFolder(id) {
     return;
   }
   state.folder = id;
-  state.pendingUnreadSort = false;
   state.goneKeys = new Set();
   closeMessage();
   clearSelection();
@@ -1972,7 +2168,6 @@ function showFolderMails(opts = {}) {
 }
 
 async function refreshMails() {
-  flushDeferredUnreadSort();
   invalidateMailCache(state.folder);
   state.page = 0;
   state.hasMore = true;
@@ -2125,10 +2320,6 @@ function applySentUnread(flag) {
   setFolderUnread(sent.id, !!flag, flag ? Math.max(1, folderUnreadCount(sent)) : 0);
 }
 
-function isItemUnread(m) {
-  return !isTrashFolder() && !!m.unread;
-}
-
 function sortMailList(items) {
   return items.slice().sort((a, b) => {
     const pa = pinTime(threadKeyOf(a));
@@ -2136,52 +2327,8 @@ function sortMailList(items) {
     if (pa && pb) return pb - pa;
     if (pa) return -1;
     if (pb) return 1;
-    const ua = isItemUnread(a);
-    const ub = isItemUnread(b);
-    if (ua !== ub) return ua ? -1 : 1;
     return dateValue(b) - dateValue(a);
   });
-}
-
-function applyListOrder() {
-  const cached = mailCache.get(mailCacheKey(state.folder, state.q));
-  if (!cached) return;
-  cached.items = sortMailList(cached.items);
-  const list = $('mailList');
-  // 保存当前滚动位置和当前激活的行，避免重排后滚动跳动
-  const scrollTop = list.scrollTop;
-  const activeUid = state.current ? String(state.current.uid) : null;
-  cached.items.forEach((m) => {
-    const row = findMailRow(list, m);
-    if (row) list.appendChild(row);
-  });
-  // 恢复滚动位置：尝试将之前激活的行保持在视口中
-  if (activeUid) {
-    const activeRow = list.querySelector(`.mail-row[data-uid="${CSS.escape(activeUid)}"]`);
-    if (activeRow) {
-      const rowTop = activeRow.offsetTop;
-      const rowHeight = activeRow.offsetHeight;
-      const listHeight = list.clientHeight;
-      // 如果行在视口上方，滚动到行的位置；如果在视口下方，保持当前滚动
-      if (rowTop < scrollTop) {
-        list.scrollTop = rowTop;
-      } else if (rowTop + rowHeight > scrollTop + listHeight) {
-        list.scrollTop = rowTop + rowHeight - listHeight;
-      } else {
-        list.scrollTop = scrollTop;
-      }
-    } else {
-      list.scrollTop = scrollTop;
-    }
-  } else {
-    list.scrollTop = scrollTop;
-  }
-}
-
-function flushDeferredUnreadSort() {
-  if (!state.pendingUnreadSort) return;
-  state.pendingUnreadSort = false;
-  applyListOrder();
 }
 
 function renderMailRows(items, opts = {}) {
@@ -2314,10 +2461,8 @@ function markRowRead(uid) {
   const key = row ? row.dataset.key : '';
   const accId = Number((row && row.dataset.acc) || actionAcc());
   const folder = (row && row.dataset.folder) || mailFolder();
-  const wasUnread = !!(row && row.classList.contains('unread'));
   if (row) row.classList.remove('unread');
   markMailReadInCaches(accId, uid, key, folder);
-  if (wasUnread) state.pendingUnreadSort = true;
   renderAccountBar();
   refreshFolderUnreadFromList();
 }
@@ -2407,10 +2552,6 @@ async function purgeSelected() {
 
 /* ---------- 读信 / 会话 ---------- */
 function openThread(uid, uidsCsv, key, refsCsv, row) {
-  const previous = state.current;
-  if (previous && (previous.thread_key !== key || String(previous.uid) !== String(uid))) {
-    flushDeferredUnreadSort();
-  }
   const cachedHint = (mailCache.get(mailCacheKey(state.folder, state.q)) || { items: [] }).items
     .find((m) => threadKeyOf(m) === key || String(m.uid) === String(uid));
   const folder = (cachedHint && cachedHint.folder) || (row && row.dataset.folder) || mailFolder();
