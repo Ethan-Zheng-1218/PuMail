@@ -58,7 +58,8 @@ function esc(s) {
     .replace(/"/g, '&quot;').replace(/\r/g, '').replace(/\n/g, ' ');
 }
 
-function toast(msg, sub) {
+function toast(msg, sub, opts) {
+  const o = opts || {};
   let t = document.querySelector('.toast');
   if (!t) {
     t = document.createElement('div');
@@ -66,6 +67,7 @@ function toast(msg, sub) {
     document.body.appendChild(t);
   }
   t.replaceChildren();
+  t.classList.toggle('is-clickable', !!o.onClick);
   const line = document.createElement('span');
   line.textContent = msg;
   t.appendChild(line);
@@ -75,9 +77,22 @@ function toast(msg, sub) {
     hint.textContent = sub;
     t.appendChild(hint);
   }
+  if (o.onClick) {
+    const go = document.createElement('small');
+    go.className = 'toast-go';
+    go.textContent = o.action || '查看 ›';
+    t.appendChild(go);
+    t.onclick = () => {
+      t.classList.remove('show');
+      clearTimeout(t._timer);
+      o.onClick();
+    };
+  } else {
+    t.onclick = null;
+  }
   t.classList.add('show');
   clearTimeout(t._timer);
-  t._timer = setTimeout(() => t.classList.remove('show'), 2600);
+  t._timer = setTimeout(() => t.classList.remove('show'), o.hold || (o.onClick ? 9000 : 2600));
 }
 
 function showSyncErrors(errors) {
@@ -730,10 +745,38 @@ let _badgeRefreshTimer = null;
 function handleNewMailNotice(n) {
   playNoticeSound();
   const label = n.email ? `${n.email} 收到 ${n.count} 封新邮件` : `收到 ${n.count} 封新邮件`;
-  toast(label);
+  const accId = n.acc_id != null ? Number(n.acc_id) : (n.acc != null ? Number(n.acc) : 0);
+  const uid = (n.uids && n.uids.length) ? String(n.uids[0]) : '';
+  const onClick = (accId && uid) ? () => openMailFromNotice(accId, uid) : null;
+  toast(label, onClick ? '点提示直接打开这封邮件' : '', {
+    onClick,
+    action: '查看 ›',
+    hold: 9000,
+  });
   // 触发 Windows 任务栏图标闪烁
   if (window.pumailAPI && window.pumailAPI.flashTaskbar) {
     window.pumailAPI.flashTaskbar();
+  }
+}
+
+async function openMailFromNotice(accId, uid) {
+  try {
+    if (state.acc !== accId) {
+      await switchAccount(accId);
+    } else if (state.folder !== 'INBOX') {
+      switchFolder('INBOX');
+    }
+    await fetchFolderMails({ background: true, merge: true });
+    const row = document.querySelector(`#mailList .mail-row[data-uid="${CSS.escape(String(uid))}"]`);
+    if (row) {
+      row.scrollIntoView({ block: 'nearest' });
+      openThread(row.dataset.uid, row.dataset.uids, row.dataset.key, row.dataset.refs, row);
+    } else {
+      // 列表里还没渲染出来：直接按 uid 打开
+      openThread(String(uid), String(uid), '', '', null);
+    }
+  } catch (err) {
+    toast('打开邮件失败：' + (err.message || err));
   }
 }
 
@@ -1283,7 +1326,10 @@ async function loadSyncStatus() {
       box.innerHTML = '<p class="settings-note muted">还没有绑定邮箱。</p>';
       return;
     }
-    box.innerHTML = accounts.map((a) => {
+    const netLine = d.proxy_active
+      ? `<p class="settings-note muted">网络：已自动通过系统代理 ${esc(d.proxy || '')} 收发邮件</p>`
+      : '<p class="settings-note muted">网络：直连（没有检测到系统代理）</p>';
+    box.innerHTML = netLine + accounts.map((a) => {
       const modeText = a.mode === 'idle' ? '实时待机'
         : a.mode === 'poll' ? '定时检查'
           : a.mode === 'manual' ? '手动' : '未启动';
@@ -1299,7 +1345,7 @@ async function loadSyncStatus() {
         <div class="sync-status-row">
           <div class="sync-status-acc">
             <strong>${esc(a.email)}</strong>
-            <small>${esc(ago)} · ${esc(wait)}</small>
+            <small>${esc(ago)} · ${esc(wait)}${a.route === 'proxy' ? ' · 经由代理' : ''}</small>
             ${err}
           </div>
           <span class="sync-status-mode ${cls}">${modeText}</span>
@@ -2473,6 +2519,28 @@ function setRowActive(uid) {
   });
 }
 
+function anyOverlayOpen() {
+  const ids = ['overlay', 'settingsOverlay', 'accountOverlay', 'sendAccOverlay', 'leaveOverlay',
+               'confirmOverlay', 'vaultSetupOverlay', 'vaultUnlockOverlay', 'vaultListOverlay',
+               'ctxMenu', 'replyComposer'];
+  return ids.some((id) => {
+    const el = $(id);
+    return el && !el.hidden;
+  });
+}
+
+function moveSelection(delta) {
+  const rows = [...document.querySelectorAll('#mailList .mail-row')]
+    .filter((row) => !row.classList.contains('is-skel'));
+  if (!rows.length) return;
+  const current = rows.findIndex((row) => row.classList.contains('active'));
+  const next = current === -1 ? (delta > 0 ? 0 : rows.length - 1) : current + delta;
+  if (next < 0 || next >= rows.length) return;
+  const row = rows[next];
+  row.scrollIntoView({ block: 'nearest' });
+  openThread(row.dataset.uid, row.dataset.uids, row.dataset.key, row.dataset.refs, row);
+}
+
 function updateBatchBar() {
   const n = state.selected.size;
   const bulk = isBulkCleanFolder();
@@ -2605,15 +2673,29 @@ function openThread(uid, uidsCsv, key, refsCsv, row) {
   setRowActive(uid);
   (async () => {
     try {
-      let d;
-      try {
-        const params = new URLSearchParams({ acc: accId, folder, uids: uids.join(',') });
-        if (refs.length) params.set('refs', refs.join(','));
-        d = await api('/api/thread?' + params);
-        if (!(d.messages || []).length) throw new Error('empty');
-      } catch (err) {
-        const one = await api('/api/mail?' + new URLSearchParams({ acc: accId, folder, uid: String(uid) }));
-        d = { messages: [one] };
+      const params = new URLSearchParams({ acc: accId, folder, uids: uids.join(',') });
+      if (refs.length) params.set('refs', refs.join(','));
+      const many = uids.length > 1;
+      let d = null;
+      if (many) {
+        // 会话里有多封时，先只取最新一封 —— 首屏立刻出内容，其余在后台补上去
+        try {
+          const first = new URLSearchParams(params);
+          first.set('part', 'newest');
+          d = await api('/api/thread?' + first);
+          if (!(d.messages || []).length) d = null;
+        } catch (err) {
+          d = null;
+        }
+      }
+      if (!d) {
+        try {
+          d = await api('/api/thread?' + params);
+          if (!(d.messages || []).length) throw new Error('empty');
+        } catch (err) {
+          const one = await api('/api/mail?' + new URLSearchParams({ acc: accId, folder, uid: String(uid) }));
+          d = { messages: [one] };
+        }
       }
       if (!state.current || state.current.openGen !== openGen) return;
       const messages = d.messages || [];
@@ -2632,6 +2714,18 @@ function openThread(uid, uidsCsv, key, refsCsv, row) {
       renderParties(first);
       $('msgDate').textContent = formatDate(latest.date) || dateTxt;
       renderThread(messages);
+      // 会话里还有更早的邮件：后台取回来插到上面，不挡住首屏
+      if (many && messages.length === 1) {
+        const rest = new URLSearchParams(params);
+        rest.set('part', 'older');
+        api('/api/thread?' + rest).then((more) => {
+          if (!state.current || state.current.openGen !== openGen) return;
+          const olderMessages = more.messages || [];
+          if (!olderMessages.length) return;
+          prependThreadMessages(olderMessages);
+          state.current.threadMessages = olderMessages.concat(state.current.threadMessages || []);
+        }).catch(() => {});
+      }
       setStarBtn(state.current.starred);
       if (!$('replyComposer').hidden) {
         const cur = addrFieldValue('replyToInput').trim();
@@ -3160,7 +3254,13 @@ function appendThreadMessage(m, box) {
   } else {
     const body = document.createElement('div');
     body.className = 'thread-msg-body';
-    body.textContent = m.body || '(无正文)';
+    if (!m.has_body && !(m.body || '').trim()) {
+      // 正文没取到（超时/断网）：这封的已读状态已经生效，再点一次就能重试
+      body.classList.add('thread-msg-missing');
+      body.textContent = '正文暂时没取到（网络或邮箱服务器超时）。这封已经算已读，再点一次这封邮件就会重新加载。';
+    } else {
+      body.textContent = m.body || '(无正文)';
+    }
     card.appendChild(body);
   }
   sec.appendChild(card);
@@ -3173,8 +3273,14 @@ function appendThreadMessage(m, box) {
         acc: (state.current && state.current.acc) || actionAcc(),
         folder: m.folder || mailFolder(),
         uid: m.uid,
-        idx: a.idx,
       });
+      if (a.part) {
+        // 新格式：直接告诉后端要哪一段，只下这一个附件
+        p.set('part', a.part);
+        if (a.name) p.set('name', a.name);
+      } else if (a.idx != null) {
+        p.set('idx', a.idx);   // 老格式：早期缓存下来的附件信息
+      }
       const link = document.createElement('a');
       link.href = '/api/attachment?' + p;
       link.textContent = `📎 ${a.name} (${(a.size / 1024).toFixed(1)} KB)`;
@@ -3196,6 +3302,32 @@ function renderThread(messages) {
   stashThreadBodies();
   hardenMailLinks(box);
   applyThreadTranslate(state.trMode || defaultTrMode());
+}
+
+function threadScroller() {
+  let el = $('threadView');
+  while (el && el !== document.body) {
+    const style = window.getComputedStyle(el);
+    if (/(auto|scroll)/.test(style.overflowY)) return el;
+    el = el.parentElement;
+  }
+  return $('threadView');
+}
+
+function prependThreadMessages(messages) {
+  const box = $('threadView');
+  if (!box || !messages.length) return;
+  const scroller = threadScroller();
+  // 保持当前看的那一段不动：先记下"距离底部还有多远"，插完再补回来
+  const anchor = scroller ? scroller.scrollHeight - scroller.scrollTop : 0;
+  const host = document.createElement('div');
+  messages.slice().sort((a, b) => dateValue(a) - dateValue(b))
+    .forEach((m) => appendThreadMessage(m, host));
+  while (host.firstChild) box.insertBefore(host.firstChild, box.firstChild);
+  stashThreadBodies();
+  hardenMailLinks(box);
+  if ((state.trMode || 'orig') !== 'orig') applyThreadTranslate(state.trMode);
+  if (scroller) scroller.scrollTop = Math.max(0, scroller.scrollHeight - anchor);
 }
 
 /* ---------- 写信 ---------- */
@@ -4625,6 +4757,18 @@ function bindEvents() {
     // 写邮件窗口也不响应 Esc：避免手一抖把草稿丢了（同上，只用 × / 存草稿 / 发送）
     else if (!$('replyComposer').hidden) hideReply();
   });
+  // J / K：上一封 / 下一封（输入框里、弹层打开时不响应）
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'j' && e.key !== 'k') return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    if (anyOverlayOpen()) return;
+    e.preventDefault();
+    moveSelection(e.key === 'j' ? 1 : -1);
+  });
+  if ($('prevMailBtn')) $('prevMailBtn').onclick = () => moveSelection(-1);
+  if ($('nextMailBtn')) $('nextMailBtn').onclick = () => moveSelection(1);
   bindSplitter();
   bindTrSwitch();
   bindMailLinkGuard();

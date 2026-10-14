@@ -1012,6 +1012,11 @@ html:not(.theme-light) .refresh-btn img {
 .sync-status-mode.is-poll { color: #f0c674; border-color: #6c5a2a; }
 .sync-status-mode.is-manual { color: #a4b0be; }
 .sync-status-err { color: #f28b82; font-size: 12px; }
+.thread-msg-missing { color: #a4b0be; font-style: italic; }
+.toast.is-clickable { cursor: pointer; }
+.toast.is-clickable:hover { border-color: #6a8caf; }
+.toast .toast-go { color: #7fb3e0; font-size: 12px; }
+html.theme-light .thread-msg-missing { color: #6b7280; }
 html.theme-light .sync-status-row { color: #374151; border-top-color: #e5e7eb; }
 html.theme-light .sync-status-acc small { color: #6b7280; }
 html.theme-light .sync-mode-select { background: #fff; color: #111; border-color: #d1d5db; }

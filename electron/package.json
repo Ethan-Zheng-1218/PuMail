@@ -1,6 +1,6 @@
 {
   "name": "pumail",
-  "version": "1.1.1",
+  "version": "1.1.5",
   "private": true,
   "description": "PuMail desktop shell",
   "main": "main.js",

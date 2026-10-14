@@ -17,11 +17,14 @@ import json
 import logging
 import os
 import re
+import quopri
 import secrets
 import select
 import shutil
 import smtplib
+import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
@@ -1495,7 +1498,13 @@ def inline_cid_images(msg, html):
         fn = dec(part.get_filename() or '')
         if fn:
             cids[fn.lower()] = url
+    return inline_cids_in_html(html, cids)
 
+
+def inline_cids_in_html(html, cids):
+    """把正文里的 cid: 引用换成已经取到的图片（data: URI）。"""
+    if not html or not cids or 'cid:' not in html.lower():
+        return html
     def sub_attr(m):
         cid = html_mod.unescape(m.group(3)).strip().strip('<>').lower()
         url = cids.get(cid)
@@ -1514,19 +1523,15 @@ def inline_cid_images(msg, html):
 
 
 def html_needs_refetch(html):
+    """只判断"这份正文是不是旧版本清洗器留下的"。是就重下一次，一辈子只重一次。
+
+    以前是按内容猜（有 cid: 内嵌图、有 button 类名就当作"没存全"），
+    那批 HTML 邮件于是每次点开都重下整封 —— 猜出来的结论永远不变，
+    重下多少次也修不好，纯粹白等。现在按版本标记判断，稳定且只发生一次。
+    """
     if not html:
         return False
-    if re.search(r'(?i)\bcid:', html):
-        return True
-    if re.search(r'(?i)<img\b(?![^>]*\bsrc\s*=\s*["\'][^"\']+["\'])', html):
-        return True
-    if re.search(r'(?is)<style[\s>]', html):
-        return False
-    if re.search(r'(?i)class=["\'][^"\']*(?:button|btn|cta|pad)', html):
-        return True
-    if re.search(r'(?i)color\s*:\s*#fff(?:fff)?', html) and re.search(r'(?i)\sclass=', html):
-        return True
-    return False
+    return not html.lstrip().startswith(HTML_RENDER_TAG)
 
 
 def repair_broken_style_quotes(h):
@@ -1539,8 +1544,12 @@ def repair_broken_style_quotes(h):
     return re.sub(r'style="([^"]*)"\s*,\s*([^"]*)"', repl, h or '', flags=re.I)
 
 
+# 正文清洗器版本标记：见 html_needs_refetch 的说明。
+HTML_RENDER_TAG = '<!--pumail-html:2-->'
+
+
 def sanitize_html(h):
-    raw = h or ''
+    raw = (h or '').replace(HTML_RENDER_TAG, '')
     styles = [_sanitize_style_block(s) for s in re.findall(r'(?is)<style[^>]*>(.*?)</style>', raw)]
     m = re.search(r'(?is)<body[^>]*>(.*)</body>', raw)
     h = m.group(1) if m else raw
@@ -1559,7 +1568,8 @@ def sanitize_html(h):
     )
     h = re.sub(r'(?i)<a\b', '<a target="_blank" rel="noopener noreferrer"', h)
     prefix = ''.join('<style>' + s + '</style>' for s in styles if s and s.strip())
-    return (prefix + h).strip()
+    out = (prefix + h).strip()
+    return (HTML_RENDER_TAG + out) if out else ''
 
 
 def get_bodies(msg):
@@ -1599,8 +1609,785 @@ def get_attachments(msg):
     return atts
 
 
+# ---------- 只取正文：先看结构，再只下文字（附件只记名字和大小） ----------
+# 目标：点开一封带 20MB 附件的邮件，也只下几十 KB 的正文；
+#       附件在界面里是"文件名 + 大小 + 下载链接"，用户点了才去取那一个附件。
+INLINE_IMAGE_MAX_BYTES = 512 * 1024        # 正文里的内嵌图（logo 这类）单张上限
+INLINE_IMAGE_MAX_COUNT = 6                 # 最多内联几张
+INLINE_IMAGE_TOTAL_BYTES = 2 * 1024 * 1024
+PREFETCH_SECTION_MAX_BYTES = 512 * 1024    # 预读时单段正文上限，超了留给点开时再取
+
+
+def parse_imap_tokens(text):
+    """把 IMAP 的 S-表达式（BODYSTRUCTURE）解析成嵌套 list。
+
+    "TEXT" → 'TEXT'；123 → 123；NIL → None；括号 → 子列表。解析不了返回 None。
+    """
+    if isinstance(text, (bytes, bytearray)):
+        text = text.decode('latin-1', 'replace')
+    out = []
+    stack = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '(':
+            stack.append([])
+            i += 1
+        elif ch == ')':
+            if not stack:
+                return None
+            done = stack.pop()
+            (stack[-1] if stack else out).append(done)
+            i += 1
+        elif ch == '"':
+            j = i + 1
+            buf = []
+            closed = False
+            while j < n:
+                c = text[j]
+                if c == '\\' and j + 1 < n:
+                    buf.append(text[j + 1])
+                    j += 2
+                    continue
+                if c == '"':
+                    closed = True
+                    break
+                buf.append(c)
+                j += 1
+            if not closed:
+                return None
+            (stack[-1] if stack else out).append(''.join(buf))
+            i = j + 1
+        elif ch in ' \r\n\t':
+            i += 1
+        else:
+            j = i
+            while j < n and text[j] not in ' \r\n\t()"':
+                j += 1
+            token = text[i:j]
+            i = max(j, i + 1)
+            if not token:
+                continue
+            if token.upper() == 'NIL':
+                value = None
+            else:
+                m = re.match(r'^-?\d+$', token)
+                value = int(token) if m else token
+            (stack[-1] if stack else out).append(value)
+    if stack:
+        return None
+    return out
+
+
+def _bs_params(node):
+    out = {}
+    if isinstance(node, list):
+        for k, v in zip(node[0::2], node[1::2]):
+            if isinstance(k, str) and isinstance(v, str):
+                out[k.upper()] = v
+    return out
+
+
+def imap_structure_parts(bs):
+    """把 BODYSTRUCTURE 拆成段落列表：[{part, type, subtype, params, encoding, size, ...}]。"""
+    # parse_imap_tokens 返回的是"顶层若干表达式"的列表，这里把最外层括号脱掉
+    if isinstance(bs, list) and len(bs) == 1 and isinstance(bs[0], list):
+        bs = bs[0]
+    parts = []
+
+    def walk(node, prefix):
+        if not isinstance(node, list) or not node:
+            return
+        idx = 0
+        children = []
+        while idx < len(node) and isinstance(node[idx], list):
+            children.append(node[idx])
+            idx += 1
+        if children:
+            for k, child in enumerate(children, start=1):
+                num = str(k) if not prefix else '%s.%d' % (prefix, k)
+                walk(child, num)
+            return
+        if len(node) < 6:
+            return
+        typ = node[0] if isinstance(node[0], str) else ''
+        sub = node[1] if isinstance(node[1], str) else ''
+        params = _bs_params(node[2])
+        cid = node[3] if isinstance(node[3], str) else ''
+        enc = node[5] if isinstance(node[5], str) else ''
+        size = node[6] if len(node) > 6 and isinstance(node[6], int) else 0
+        disp = ''
+        disp_params = {}
+        for extra in node[7:]:
+            if isinstance(extra, list) and extra and isinstance(extra[0], str):
+                key = extra[0].upper()
+                if key in ('ATTACHMENT', 'INLINE'):
+                    disp = key
+                    if len(extra) > 1:
+                        disp_params = _bs_params(extra[1])
+        parts.append({
+            'part': prefix or '1',
+            'type': typ.upper(),
+            'subtype': sub.upper(),
+            'params': params,
+            'content_id': cid.strip().strip('<>'),
+            'encoding': enc.upper(),
+            'size': int(size or 0),
+            'disposition': disp,
+            'disp_params': disp_params,
+        })
+        # 转发的邮件（message/rfc822）：里面还嵌着一整封，它的附件也要能列出来
+        if typ.upper() == 'MESSAGE' and sub.upper() == 'RFC822':
+            for extra in node[7:]:
+                if isinstance(extra, list) and extra and isinstance(extra[0], list):
+                    walk(extra, (prefix or '1') + '.1')
+                    break
+
+    walk(bs, '')
+    return parts
+
+
+def _balanced_parens(text, start):
+    """从 start 处的 '(' 开始取到配对的 ')'（含两端）。"""
+    depth = 0
+    i = start
+    n = len(text)
+    in_quote = False
+    while i < n:
+        c = text[i]
+        if in_quote:
+            if c == '\\':
+                i += 2
+                continue
+            if c == '"':
+                in_quote = False
+        elif c == '"':
+            in_quote = True
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+        i += 1
+    return ''
+
+
+def imap_fetch_structure(conn, uid):
+    """取一封邮件的结构 + FLAGS（几百字节，不碰正文）。返回 (结构文本, flags)。"""
+    typ, d = conn.uid('fetch', str(uid).encode(), '(FLAGS BODYSTRUCTURE)')
+    if typ != 'OK' or not d:
+        return '', b''
+    # 结构里的文件名等参数，服务器常用 IMAP literal（{n} + 原始字节）给。
+    # 这里把 literal 还原成带引号的字符串，否则结构解析会错位。
+    text = ''
+    for item in d:
+        if isinstance(item, tuple):
+            meta = item[0] if isinstance(item[0], (bytes, bytearray)) else b''
+            data = item[1] if isinstance(item[1], (bytes, bytearray)) else b''
+            chunk = bytes(meta).decode('latin-1', 'replace')
+            has_literal = bool(re.search(r'\{\d+\}\s*$', chunk))
+            chunk = re.sub(r'\{\d+\}\s*$', '', chunk)
+            if has_literal:
+                lit = bytes(data).decode('latin-1', 'replace')
+                chunk += '"' + lit.replace('\\', '\\\\').replace('"', '\\"') + '"'
+            text += chunk
+        elif isinstance(item, (bytes, bytearray)):
+            text += bytes(item).decode('latin-1', 'replace')
+    m = re.search(r'FLAGS\s+\(([^)]*)\)', text)
+    flags = m.group(1).encode('latin-1', 'replace') if m else b''
+    pos = text.find('BODYSTRUCTURE ')
+    if pos < 0:
+        return '', flags
+    brace = text.find('(', pos)
+    if brace < 0:
+        return '', flags
+    return _balanced_parens(text, brace), flags
+
+
+def imap_fetch_sections(conn, uid, sections):
+    """一次取回若干段落（正文/内嵌图/附件），返回 {段号: 原始字节}。"""
+    sections = [str(s) for s in sections if s]
+    if not sections:
+        return {}
+    spec = ' '.join('BODY.PEEK[%s]' % s for s in sections)
+    typ, d = conn.uid('fetch', str(uid).encode(), '(' + spec + ')')
+    if typ != 'OK' or not d:
+        return {}
+    out = {}
+    for item in d:
+        if isinstance(item, tuple):
+            meta = item[0] if isinstance(item[0], (bytes, bytearray)) else b''
+            meta = bytes(meta)
+            names = re.findall(rb'BODY\[([^\]]*)\]', meta)
+            if not names:
+                continue
+            name = names[-1].decode('ascii', 'replace').strip()
+            data = item[1] if isinstance(item[1], (bytes, bytearray)) else b''
+            if name:
+                out[name] = bytes(data)
+        elif isinstance(item, (bytes, bytearray)):
+            text = bytes(item)
+            for m in re.finditer(rb'BODY\[([^\]]*)\]\s+(?:"\s*"|NIL)', text):
+                out.setdefault(m.group(1).decode('ascii', 'replace').strip(), b'')
+    return out
+
+
+def decode_section(data, encoding):
+    """按段落自己的传输编码解码（base64 / quoted-printable / 原样）。"""
+    enc = (encoding or '').upper()
+    if not data:
+        return b''
+    if enc == 'BASE64':
+        try:
+            return base64.b64decode(re.sub(rb'\s+', b'', data) + b'===')
+        except Exception:
+            return bytes(data)
+    if enc == 'QUOTED-PRINTABLE':
+        try:
+            return quopri.decodestring(bytes(data))
+        except Exception:
+            return bytes(data)
+    return bytes(data)
+
+
+def decode_charset(data, charset):
+    for enc in (charset, 'utf-8', 'gb18030', 'latin-1'):
+        if not enc:
+            continue
+        try:
+            return data.decode(enc, 'strict')
+        except Exception:
+            continue
+    return data.decode('utf-8', 'replace')
+
+
+def decode_param_text(value):
+    """结构里的参数（文件名等）：可能是 MIME 编码词，也可能是原始 UTF-8/GBK 字节。"""
+    if not value:
+        return ''
+    if '=?' in value:
+        return dec(value)
+    try:
+        raw = value.encode('latin-1', 'ignore')
+    except Exception:
+        return value
+    for enc in ('utf-8', 'gbk', 'big5', 'latin-1'):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return value
+
+
+def decode_rfc2231(value):
+    """RFC 2231 的扩展参数：utf-8''CHARLS%E7%BB%8F... → CHARLS经济学年会征文.pdf"""
+    if not value:
+        return ''
+    charset = 'utf-8'
+    text = value
+    m = re.match(r"^([^']*)'([^']*)'(.*)$", value)
+    if m:
+        charset = m.group(1) or 'utf-8'
+        text = m.group(3)
+    try:
+        raw = urllib.parse.unquote_to_bytes(text)
+    except Exception:
+        return text
+    for enc in (charset, 'utf-8', 'gbk', 'latin-1'):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return text
+
+
+def _structure_part_name(params, disp_params):
+    """从参数里挑出附件名：优先 RFC 2231 扩展形式，再退回普通形式。"""
+    for key in ('NAME*', 'FILENAME*'):
+        if params.get(key):
+            return decode_rfc2231(params[key])
+        if disp_params.get(key):
+            return decode_rfc2231(disp_params[key])
+    for key in ('NAME', 'FILENAME'):
+        if params.get(key):
+            return decode_param_text(params[key])
+        if disp_params.get(key):
+            return decode_param_text(disp_params[key])
+    return ''
+
+
+def fetch_body_parts(acc, folder, uid, conn, max_section_bytes=None):
+    """只下正文（文字 + 小内嵌图）。附件只记名字/大小/段号，内容不下。
+
+    返回同 _message_data 的结构；结构不认识、解析失败、或"太大不适合预读"时返回 None，
+    调用方会退回"整封下载"的老路，保证不会出现打不开/乱码。
+    """
+    structure, flags = imap_fetch_structure(conn, uid)
+    if not structure:
+        return None
+    parts = imap_structure_parts(parse_imap_tokens(structure))
+    if not parts:
+        return None
+
+    text_parts = [p for p in parts
+                  if p['type'] == 'TEXT' and p['subtype'] in ('PLAIN', 'HTML')
+                  and not p['params'].get('NAME') and not p['params'].get('FILENAME')]
+    if not text_parts:
+        return None
+    html_part = next((p for p in text_parts if p['subtype'] == 'HTML'), None)
+    plain_part = next((p for p in text_parts if p['subtype'] == 'PLAIN'), None)
+    if max_section_bytes:
+        for p in (html_part, plain_part):
+            if p and p['size'] > max_section_bytes:
+                imap_log(acc, 'BODY skip big text', folder, uid, 'size', p['size'])
+                return None
+
+    attachments = []
+    for p in parts:
+        name = _structure_part_name(p['params'], p['disp_params'])
+        if name:
+            size = p['size']
+            if p['encoding'] == 'BASE64':
+                # 结构里给的是编码后大小，base64 大约涨 1/3，换算回文件真实大小
+                size = int(size * 3 / 4)
+            attachments.append({'part': p['part'], 'name': name, 'size': size})
+
+    wanted = [p for p in (html_part, plain_part) if p]
+    sections = ['HEADER.FIELDS (MESSAGE-ID CC REPLY-TO)'] + [p['part'] for p in wanted]
+    got = imap_fetch_sections(conn, uid, sections)
+    if html_part and html_part['part'] not in got:
+        return None
+    if not got:
+        return None
+
+    headers = got.get('HEADER.FIELDS (MESSAGE-ID CC REPLY-TO)', b'')
+    head_msg = message_from_bytes(headers) if headers else None
+
+    html_raw = ''
+    if html_part:
+        blob = decode_section(got.get(html_part['part']), html_part['encoding'])
+        html_raw = decode_charset(blob, html_part['params'].get('CHARSET'))
+    plain_raw = ''
+    if plain_part:
+        blob = decode_section(got.get(plain_part['part']), plain_part['encoding'])
+        plain_raw = decode_charset(blob, plain_part['params'].get('CHARSET'))
+
+    html_out = ''
+    if html_raw:
+        html_out = html_raw
+        if 'cid:' in html_out.lower():
+            html_out = inline_cids_in_html(html_out, fetch_cid_images(conn, uid, parts, html_out))
+        html_out = sanitize_html(html_out)
+
+    body = (plain_raw or '').strip() or (strip_html(html_out) if html_out else '') or '(无正文)'
+    # 邮件头（主题/发件人/时间）本来就在本地库里：这里必须原样带上，
+    # 否则 upsert_headers 会把已有的标题、发件人冲掉。
+    row = load_mail_row(acc['id'], folder, uid) or {}
+    data = {
+        'uid': str(uid),
+        'folder': folder,
+        'subject': row.get('subject') or '',
+        'from': row.get('sender') or '',
+        'from_addr': row.get('from_addr') or '',
+        'date': row.get('date_raw') or '',
+        'ts': row.get('ts') or 0,
+        'mine': bool(row.get('mine')),
+        'body': body,
+        'html': html_out,
+        'attachments': attachments,
+        'starred': b'\\Flagged' in flags,
+        'unread': b'\\Seen' not in flags,
+        'message_id': (dec(head_msg.get('Message-ID')) or '').strip() if head_msg else '',
+        'in_reply_to': (dec(head_msg.get('In-Reply-To')) or '').strip() if head_msg else '',
+        'to': (format_addr_list(head_msg.get('To')) if head_msg else '') or (row.get('recipients') or ''),
+        'cc': (format_addr_list(head_msg.get('Cc')) if head_msg else '') or (row.get('cc') or ''),
+    }
+    return data
+
+
+def fetch_cid_images(conn, uid, parts, html):
+    """把正文里用到的内嵌小图取回来（大的、太多的都跳过）。返回 cid → data: URI。"""
+    used = {m.strip().strip('<>').lower()
+            for m in re.findall(r'(?i)cid:([^"\'\s)]+)', html)}
+    if not used:
+        return {}
+    picks = []
+    total = 0
+    for p in parts:
+        if p['type'] != 'IMAGE':
+            continue
+        cid = (p['content_id'] or '').lower()
+        if not cid or cid not in used:
+            continue
+        if p['size'] > INLINE_IMAGE_MAX_BYTES:
+            continue
+        if len(picks) >= INLINE_IMAGE_MAX_COUNT or total + p['size'] > INLINE_IMAGE_TOTAL_BYTES:
+            continue
+        picks.append((p, cid))
+        total += p['size']
+    if not picks:
+        return {}
+    got = imap_fetch_sections(conn, uid, [p['part'] for p, _ in picks])
+    out = {}
+    for p, cid in picks:
+        blob = decode_section(got.get(p['part']), p['encoding'])
+        if not blob:
+            continue
+        subtype = (p['subtype'] or 'png').lower()
+        ct = 'image/' + subtype if subtype != 'jpg' else 'image/jpeg'
+        out[cid] = 'data:%s;base64,%s' % (ct, base64.b64encode(blob).decode('ascii'))
+    return out
+
+
 # ---------- IMAP / SMTP ----------
-IMAP_CLIENT_ID = '("name" "PuMail" "version" "1.1.1" "vendor" "PuMail" "support-email" "pumail@localhost")'
+IMAP_CLIENT_ID = '("name" "PuMail" "version" "1.1.5" "vendor" "PuMail" "support-email" "pumail@localhost")'
+
+
+# ---------- 网络代理：自动跟随系统代理，用户不用管 ----------
+# 为什么需要：Gmail 这类境外服务器在国内直连不通，而代理工具（Clash 等）
+# 一般只设了"系统代理"，Python 的 socket 不会自动走它 —— 于是浏览器能开、
+# 邮件客户端却一直转圈。这里让 PuMail 自己读系统代理并把邮件连接送进去；
+# 国内邮箱（QQ / 163…）仍然直连，谁都不影响。
+PROXY_SETTING_KEY = 'proxy_url'     # 留空 = 自动；填了用手动值（给高级用户，界面上不暴露）
+CONNECT_TIMEOUT = 8                 # 建连接超时：连不上要快点报出来，别再干等 30 秒
+DIRECT_PROBE_TIMEOUT = 3            # 先短超时试着直连（国内邮箱走这条），失败再走代理
+PROXY_MEMO_TTL = 600                # 记住"这台服务器该直连还是走代理"多久
+_CONNECT_BREAK_AFTER = 2            # 连续连不上这么多次就先歇一会儿
+_CONNECT_BREAK_SECONDS = 180
+_proxy_cache = {'ts': 0, 'value': None}
+_host_route = {}                    # host -> ('direct'|'proxy', 记录时间)
+_connect_fails = {}                 # acc_id -> (连续失败次数, 时间)
+
+# 国内邮箱永远直连：它们本来就在国内，绕代理只会更慢、还依赖代理一直开着。
+# 只有国外服务器（Gmail / Outlook / iCloud 等）才需要代理帮忙。
+_DOMESTIC_MAIL_DOMAINS = (
+    'qq.com', 'foxmail.com', 'exmail.qq.com', 'weixin.qq.com',
+    '163.com', '126.com', 'yeah.net', '188.com', 'vip.163.com', 'vip.126.com', 'vip.188.com',
+    'sina.com', 'sina.cn', 'sohu.com', 'tom.com', '263.net', '21cn.com', 'china.com',
+    'aliyun.com', 'alibaba.com', 'dingtalk.com', '139.com', '189.cn', 'wo.cn', 'cmcc.com',
+    'netease.com', 'baidu.com', 'tencent.com', 'jd.com', 'bilibili.com', 'zhihu.com',
+)
+
+
+def is_domestic_host(host):
+    """是不是国内邮箱服务器（这类一律直连，不走代理）。"""
+    h = str(host or '').strip().lower().rstrip('.')
+    if not h:
+        return False
+    return any(h == d or h.endswith('.' + d) for d in _DOMESTIC_MAIL_DOMAINS)
+
+
+# 明确需要代理帮忙的国外邮箱服务器：有代理就直接走代理，不再浪费 3 秒去试直连
+FOREIGN_MAIL_DOMAINS = (
+    'gmail.com', 'googlemail.com', 'google.com',
+    'outlook.com', 'outlook.office365.com', 'office365.com', 'hotmail.com', 'live.com',
+    'icloud.com', 'me.com', 'mac.com',
+    'yahoo.com', 'aol.com', 'zoho.com', 'yandex.com', 'protonmail.com', 'proton.me',
+    'gmx.com', 'gmx.net', 'fastmail.com', 'mail.com',
+)
+
+
+def is_foreign_mail_host(host):
+    """是不是明确需要代理的国外邮箱服务器。"""
+    h = str(host or '').strip().lower().rstrip('.')
+    if not h or is_domestic_host(h):
+        return False
+    return any(h == d or h.endswith('.' + d) for d in FOREIGN_MAIL_DOMAINS)
+
+
+def _read_windows_proxy():
+    if os.name != 'nt':
+        return ''
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r'Software\Microsoft\Windows\CurrentVersion\Internet Settings')
+        try:
+            enabled, _ = winreg.QueryValueEx(key, 'ProxyEnable')
+            server, _ = winreg.QueryValueEx(key, 'ProxyServer')
+        finally:
+            winreg.CloseKey(key)
+        if not enabled or not server:
+            return ''
+        return _pick_proxy_server(str(server))
+    except Exception:
+        return ''
+
+
+def _pick_proxy_server(server):
+    """系统代理可能是 'host:port'，也可能是 'http=a;https=b' 这种按协议分开写。"""
+    server = (server or '').strip()
+    if '=' in server:
+        pairs = {}
+        for part in server.split(';'):
+            if '=' in part:
+                k, v = part.split('=', 1)
+                pairs[k.strip().lower()] = v.strip()
+        server = (pairs.get('https') or pairs.get('http')
+                  or (list(pairs.values())[0] if pairs else ''))
+    return server.strip()
+
+
+def system_proxy():
+    """当前该用的代理：'host:port' 或带 scheme，没有就返回 ''。"""
+    manual = (setting_get(PROXY_SETTING_KEY, '') or '').strip()
+    if manual:
+        return manual
+    now = time.time()
+    if _proxy_cache['value'] is not None and now - _proxy_cache['ts'] < 60:
+        return _proxy_cache['value']
+    value = ''
+    for name in ('ALL_PROXY', 'all_proxy', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'):
+        env = (os.environ.get(name) or '').strip()
+        if env:
+            value = env
+            break
+    if not value:
+        value = _read_windows_proxy()
+    _proxy_cache['value'] = value
+    _proxy_cache['ts'] = now
+    return value
+
+
+def _parse_proxy(value):
+    """'127.0.0.1:7897' / 'socks5://user:pass@host:port' → (scheme, host, port, user, pass)。"""
+    if not value:
+        return None
+    text = str(value).strip()
+    scheme = ''
+    m = re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*)://(.*)$', text)
+    if m:
+        scheme = m.group(1).lower()
+        text = m.group(2)
+    user = password = ''
+    if '@' in text:
+        cred, text = text.rsplit('@', 1)
+        if ':' in cred:
+            user, password = cred.split(':', 1)
+        else:
+            user = cred
+    if text.startswith('['):                       # [::1]:7897
+        host, _, rest = text.partition(']')
+        host = host[1:]
+        port = rest.lstrip(':')
+    else:
+        host, _, port = text.rpartition(':')
+        if not host:
+            host, port = text, ''
+    try:
+        port = int(port or 0)
+    except Exception:
+        return None
+    if not host or not port or port > 65535:
+        return None
+    if scheme in ('http', 'https'):
+        scheme = 'http'
+    elif scheme in ('socks', 'socks5', 'socks5h'):
+        scheme = 'socks5'
+    elif scheme:
+        return None
+    else:
+        scheme = 'socks5'      # Clash 这类混合端口两种协议都收，先按 SOCKS5 试
+    return (scheme, host, port, user, password)
+
+
+def _recv_exact(sock, n):
+    buf = b''
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise RuntimeError('代理连接中断')
+        buf += chunk
+    return buf
+
+
+def _socks5_tunnel(sock, host, port, user='', password=''):
+    sock.sendall(b'\x05\x02\x00\x02' if (user or password) else b'\x05\x01\x00')
+    resp = _recv_exact(sock, 2)
+    if resp[0] != 5:
+        raise RuntimeError('代理不是 SOCKS5')
+    if resp[1] == 2:
+        u = (user or '').encode('utf-8')
+        p = (password or '').encode('utf-8')
+        sock.sendall(b'\x01' + bytes([len(u)]) + u + bytes([len(p)]) + p)
+        resp = _recv_exact(sock, 2)
+    if resp[1] != 0:
+        raise RuntimeError('SOCKS5 认证失败（%d）' % resp[1])
+    name = host.encode('idna')
+    sock.sendall(b'\x05\x01\x00\x03' + bytes([len(name)]) + name + int(port).to_bytes(2, 'big'))
+    head = _recv_exact(sock, 4)
+    if head[1] != 0:
+        raise RuntimeError('SOCKS5 连接被拒绝（%d）' % head[1])
+    atyp = head[3]
+    if atyp == 1:
+        _recv_exact(sock, 4)
+    elif atyp == 4:
+        _recv_exact(sock, 16)
+    elif atyp == 3:
+        _recv_exact(sock, _recv_exact(sock, 1)[0])
+    _recv_exact(sock, 2)
+
+
+def _http_connect_tunnel(sock, host, port, user='', password=''):
+    lines = ['CONNECT %s:%d HTTP/1.1' % (host, port), 'Host: %s:%d' % (host, port)]
+    if user or password:
+        token = base64.b64encode(('%s:%s' % (user, password)).encode('utf-8')).decode('ascii')
+        lines.append('Proxy-Authorization: Basic ' + token)
+    sock.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode('ascii'))
+    # 逐字节读到 header 结束：多读会把这之后的真实数据吞掉
+    data = b''
+    while not data.endswith(b'\r\n\r\n') and len(data) < 8192:
+        byte = sock.recv(1)
+        if not byte:
+            break
+        data += byte
+    head = data.split(b'\r\n', 1)[0].decode('latin-1', 'replace')
+    if ' 200' not in head:
+        raise RuntimeError('代理拒绝 CONNECT：%s' % head[:60])
+
+
+def _via_proxy(proxy, host, port, timeout):
+    """穿过代理建立到 host:port 的裸连接。"""
+    scheme, phost, pport, puser, ppass = proxy
+    last = None
+    for kind in (scheme, 'http' if scheme == 'socks5' else 'socks5'):
+        sock = None
+        try:
+            sock = socket.create_connection((phost, pport), timeout)
+            if kind == 'socks5':
+                _socks5_tunnel(sock, host, port, puser, ppass)
+            else:
+                _http_connect_tunnel(sock, host, port, puser, ppass)
+            return sock
+        except Exception as e:
+            last = e
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+    raise last or RuntimeError('代理连接失败')
+
+
+def open_tcp(host, port, timeout=CONNECT_TIMEOUT):
+    """连到 host:port：国内邮箱直连；国外服务器直连不通时自动走代理。"""
+    host = str(host or '')
+    port = int(port or 0)
+    if not host or not port:
+        raise RuntimeError('服务器地址无效')
+    if is_domestic_host(host):
+        # 国内邮箱（QQ/163/126…）永远直连：不绕代理，也不受"上次走代理"的记忆影响
+        route = _host_route.get(host)
+        if route and route[0] != 'direct':
+            _host_route.pop(host, None)
+        return socket.create_connection((host, port), timeout)
+    proxy = _parse_proxy(system_proxy())
+    if not proxy:
+        return socket.create_connection((host, port), timeout)
+    route = _host_route.get(host)
+    memo = route[0] if route and time.time() - route[1] < PROXY_MEMO_TTL else None
+    # 两条路都留着：记住的优先，但另一条也兜底（比如用户把代理关掉了）
+    if memo == 'proxy':
+        tries = [('proxy', False), ('direct', False)]
+    elif memo == 'direct':
+        tries = [('direct', False), ('proxy', False)]
+    elif is_foreign_mail_host(host):
+        # 国外的邮箱：直接走代理（省掉"先试直连再失败"的那几秒），代理不行再退回直连
+        tries = [('proxy', False), ('direct', False)]
+    else:
+        tries = [('direct', True), ('proxy', False)]      # 头一次：短超时探一下直连
+    last = None
+    for kind, probe in tries:
+        try:
+            if kind == 'direct':
+                sock = socket.create_connection(
+                    (host, port), min(timeout, DIRECT_PROBE_TIMEOUT) if probe else timeout)
+                _host_route[host] = ('direct', time.time())
+                return sock
+            sock = _via_proxy(proxy, host, port, timeout)
+            _host_route[host] = ('proxy', time.time())
+            return sock
+        except Exception as e:
+            last = e
+    raise last or RuntimeError('连接失败')
+
+
+def open_tls(host, port, timeout=CONNECT_TIMEOUT, context=None):
+    """连接并完成 TLS 握手。
+
+    注意：被墙的线路往往"TCP 能握手、TLS 被重置"，所以这里在 TLS 失败时
+    也会改用代理再试一次，而不是只判断 TCP 能不能连上。
+    """
+    host = str(host or '')
+    port = int(port or 0)
+    if not host or not port:
+        raise RuntimeError('服务器地址无效')
+    ctx = context or ssl.create_default_context()
+    server_hostname = host if getattr(ssl, 'HAS_SNI', False) else None
+    if is_domestic_host(host):
+        # 国内邮箱永远直连
+        route = _host_route.get(host)
+        if route and route[0] != 'direct':
+            _host_route.pop(host, None)
+        raw = socket.create_connection((host, port), timeout)
+        return ctx.wrap_socket(raw, server_hostname=server_hostname)
+    proxy = _parse_proxy(system_proxy())
+    route = _host_route.get(host)
+    memo = route[0] if route and time.time() - route[1] < PROXY_MEMO_TTL else None
+    if not proxy:
+        raw = socket.create_connection((host, port), timeout)
+        return ctx.wrap_socket(raw, server_hostname=server_hostname)
+    if memo == 'proxy':
+        tries = [('proxy', False), ('direct', False)]
+    elif memo == 'direct':
+        tries = [('direct', False), ('proxy', False)]
+    elif is_foreign_mail_host(host):
+        tries = [('proxy', False), ('direct', False)]
+    else:
+        tries = [('direct', True), ('proxy', False)]
+    last = None
+    for kind, probe in tries:
+        try:
+            if kind == 'direct':
+                raw = socket.create_connection(
+                    (host, port), min(timeout, DIRECT_PROBE_TIMEOUT) if probe else timeout)
+                wrapped = ctx.wrap_socket(raw, server_hostname=server_hostname)
+                _host_route[host] = ('direct', time.time())
+                return wrapped
+            sock = _via_proxy(proxy, host, port, timeout)
+            wrapped = ctx.wrap_socket(sock, server_hostname=server_hostname)
+            _host_route[host] = ('proxy', time.time())
+            return wrapped
+        except Exception as e:
+            last = e
+    raise last or RuntimeError('连接失败')
+
+
+def host_route(host):
+    route = _host_route.get(str(host or ''))
+    return route[0] if route else ''
+
+
+def connect_allowed(acc_id):
+    """连续连不上就先歇一会儿，别让用户对着转圈干等。"""
+    fails, ts = _connect_fails.get(acc_id, (0, 0))
+    return not (fails >= _CONNECT_BREAK_AFTER and time.time() - ts < _CONNECT_BREAK_SECONDS)
+
+
+def note_connect(acc_id, ok):
+    if ok:
+        _connect_fails.pop(acc_id, None)
+        return
+    fails, _ts = _connect_fails.get(acc_id, (0, 0))
+    _connect_fails[acc_id] = (fails + 1, time.time())
+
+
+class _ProxyIMAP4SSL(imaplib.IMAP4_SSL):
+    """IMAP：有代理就走代理，没有就走直连。"""
+
+    def _create_socket(self, timeout):
+        return open_tls(self.host, self.port, timeout or CONNECT_TIMEOUT, self.ssl_context)
 
 
 def needs_imap_id(host):
@@ -1766,12 +2553,22 @@ def imap_send_id(conn):
 def imap_open(acc, timeout=30):
     host = acc.get('imap_host') or ''
     port = int(acc.get('imap_port') or 993)
+    if not connect_allowed(acc['id']):
+        # 刚连续失败过：先快速报错，让界面直接显示"连不上"，别再干等
+        imap_log(acc, 'CONNECT skipped', host, 'reason', 'recent failures')
+        raise RuntimeError('连不上 %s：网络或代理不通，稍后自动重试' % host)
     imap_log(acc, 'CONNECT', host, port)
     try:
-        conn = imaplib.IMAP4_SSL(host, port, timeout=timeout)
+        conn = _ProxyIMAP4SSL(host, port, timeout=min(timeout, CONNECT_TIMEOUT))
     except Exception as e:
         imap_log(acc, 'CONNECT fail', type(e).__name__, e)
+        note_connect(acc['id'], False)
         raise
+    note_connect(acc['id'], True)
+    route = host_route(host)
+    if route:
+        imap_log(acc, 'CONNECT route', host, route,
+                 ('via ' + (system_proxy() or '')) if route == 'proxy' else '')
     try:
         conn.sock.settimeout(30)
     except Exception:
@@ -1938,6 +2735,18 @@ def imap_all_uids(conn):
         return []
 
 
+class _ProxySMTP(smtplib.SMTP):
+    """发信走代理（SSL / STARTTLS 用子类分别处理）。"""
+
+    def _get_socket(self, host, port, timeout):
+        return open_tcp(host, port, timeout or CONNECT_TIMEOUT)
+
+
+class _ProxySMTPSSL(_ProxySMTP, smtplib.SMTP_SSL):
+    def _get_socket(self, host, port, timeout):
+        return open_tls(host, port, timeout or CONNECT_TIMEOUT, self.context)
+
+
 def smtp_send(acc, to_addrs, msg):
     host = acc['smtp_host']
     port = int(acc['smtp_port'] or 465)
@@ -1956,9 +2765,9 @@ def smtp_send(acc, to_addrs, msg):
         smtp = None
         try:
             if kind == 'ssl':
-                smtp = smtplib.SMTP_SSL(h, p, timeout=40)
+                smtp = _ProxySMTPSSL(h, p, timeout=CONNECT_TIMEOUT)
             else:
-                smtp = smtplib.SMTP(h, p, timeout=40)
+                smtp = _ProxySMTP(h, p, timeout=CONNECT_TIMEOUT)
             smtp.ehlo()
             if kind == 'starttls':
                 smtp.starttls()
@@ -2053,7 +2862,11 @@ def select_folder(conn, folder, readonly=True, acc=None):
                 cands.append(cand)
     current = getattr(conn, '_pumail_mailbox', None)
     if current and current in cands:
-        return True
+        # 同一个文件夹已经选过：只读的活儿用只读选择就够；但要用 STORE 改已读/星标
+        # （readonly=False）就必须真的切成读写选择，否则服务器会拒绝写操作——
+        # 以前这里不区分读写，结果"已读"经常推不上去。
+        if readonly or not getattr(conn, '_pumail_readonly', False):
+            return True
     for cand in cands:
         try:
             typ, data = conn.select(cand, readonly=readonly)
@@ -2069,6 +2882,7 @@ def select_folder(conn, folder, readonly=True, acc=None):
                 try:
                     conn._pumail_exists = exists
                     conn._pumail_mailbox = cand
+                    conn._pumail_readonly = readonly
                 except Exception:
                     pass
                 uidv = imap_uidvalidity(conn)
@@ -4064,8 +4878,50 @@ def unread_summary(recent_only=False):
     return stats_cached(('summary', bool(recent_only)), build)
 
 
+def _message_data(acc, folder, uid, raw, flags=b''):
+    """把取回来的原始邮件解析成"入库 + 回传给界面"的结构。"""
+    msg = message_from_bytes(raw)
+    nm, addr = parseaddr(dec(msg.get('From')))
+    body, html_out = get_bodies(msg)
+    return {
+        'uid': str(uid),
+        'folder': folder,
+        'subject': dec(msg.get('Subject')) or '(无主题)',
+        'from': (nm + ' <' + addr + '>') if nm else addr,
+        'from_addr': addr,
+        'to': format_addr_list(msg.get('To')),
+        'cc': format_addr_list(msg.get('Cc')),
+        'date': dec(msg.get('Date')) or '',
+        'body': body,
+        'html': html_out,
+        'attachments': get_attachments(msg),
+        'starred': b'\\Flagged' in flags,
+        'unread': b'\\Seen' not in flags,
+        'message_id': (msg.get('Message-ID') or '').strip(),
+        'in_reply_to': (dec(msg.get('In-Reply-To')) or '').strip(),
+        'mine': (addr or '').lower() == (acc.get('email') or '').lower(),
+    }
+
+
+def _store_body(acc, folder, uid, data):
+    if (folder, str(uid)) not in pending_delete_keys(acc['id']):
+        upsert_headers(acc, folder, [data])
+        save_body(acc['id'], folder, uid, data)
+
+
+def body_error_text(e):
+    """把技术报错翻译成用户看得懂的一句话。"""
+    text = str(e or '')
+    name = type(e).__name__
+    if '10060' in text or 'timed out' in text or name in ('timeout', 'TimeoutError'):
+        return '连不上邮件服务器（网络或代理不通）'
+    if '连不上' in text or '代理' in text:
+        return text[:80]
+    return text[:80] or name
+
+
 def fetch_one_body(acc, folder, uid, priority=None):
-    """抓一封邮件的正文。priority 用来在后台预下载时给用户操作让路。"""
+    """抓一封邮件的正文（整封）。priority 让后台预读给用户操作让路。"""
     if is_demo_account(acc):
         row = load_mail_row(acc['id'], folder, uid)
         return row_to_message(row, acc) if row else None
@@ -4073,38 +4929,93 @@ def fetch_one_body(acc, folder, uid, priority=None):
     def work(conn):
         if not select_folder(conn, folder, readonly=True):
             return None
-        typ, d = conn.uid('fetch', str(uid).encode(), '(RFC822 FLAGS)')
-        if not d or not d[0] or not isinstance(d[0], tuple):
-            return None
-        raw = d[0][1]
-        flags = d[0][0] if isinstance(d[0][0], bytes) else b''
-        msg = message_from_bytes(raw)
-        nm, addr = parseaddr(dec(msg.get('From')))
-        body, html_out = get_bodies(msg)
-        data = {
-            'uid': str(uid),
-            'folder': folder,
-            'subject': dec(msg.get('Subject')) or '(无主题)',
-            'from': (nm + ' <' + addr + '>') if nm else addr,
-            'from_addr': addr,
-            'to': format_addr_list(msg.get('To')),
-            'cc': format_addr_list(msg.get('Cc')),
-            'date': dec(msg.get('Date')) or '',
-            'body': body,
-            'html': html_out,
-            'attachments': get_attachments(msg),
-            'starred': b'\\Flagged' in flags,
-            'unread': b'\\Seen' not in flags,
-            'message_id': (msg.get('Message-ID') or '').strip(),
-            'in_reply_to': (dec(msg.get('In-Reply-To')) or '').strip(),
-            'mine': (addr or '').lower() == (acc.get('email') or '').lower(),
-        }
-        if (folder, str(uid)) not in pending_delete_keys(acc['id']):
-            upsert_headers(acc, folder, [data])
-            save_body(acc['id'], folder, uid, data)
+        # ① 只下正文：附件只记名字和大小，用户点了下载链接才去取那一个
+        try:
+            data = fetch_body_parts(acc, folder, uid, conn)
+        except Exception as e:
+            imap_log(acc, 'BODY parts err', folder, uid, type(e).__name__, e)
+            data = None
+        if data is None:
+            # ② 结构太怪、或者取不到文字：退回整封下载，保证一定看得见
+            imap_log(acc, 'BODY fallback full', folder, uid)
+            typ, d = conn.uid('fetch', str(uid).encode(), '(BODY.PEEK[] FLAGS)')
+            if not d or not d[0] or not isinstance(d[0], tuple):
+                return None
+            raw = d[0][1]
+            flags = d[0][0] if isinstance(d[0][0], bytes) else b''
+            data = _message_data(acc, folder, uid, raw, flags)
+        _store_body(acc, folder, uid, data)
         return data
 
     return with_imap(acc, work, priority=priority)
+
+
+BODY_PREFETCH_MAX_BYTES = 262144   # 预热正文最多下 256KB：超了就说明有附件，留给点开时再取
+BODY_PREFETCH_LIMIT = 3            # 每来一批新邮件，最多预热最新几封
+_prefetch_running = set()
+_prefetch_guard = threading.Lock()
+
+
+def prefetch_body(acc, folder, uid, priority=sync_queue.PRIORITY_BACKGROUND):
+    """后台预读正文：只取文本、不带附件、不改服务器上的已读状态。
+
+    用部分取法先下前 256KB：拿到的字节数等于邮件大小才算完整，否则说明这封
+    带大附件，直接放弃（等用户点开时再整封取），避免后台白下几十 MB。
+    """
+    if is_demo_account(acc):
+        return False
+
+    # 本地已经有正文的就别再看一眼服务器（预热要能重复调用而不浪费）
+    db = get_db()
+    row = db.execute('SELECT has_body, html FROM mails WHERE acc_id=? AND folder=? AND uid=?',
+                     (acc['id'], folder, str(uid))).fetchone()
+    db.close()
+    if row and row['has_body'] and not html_needs_refetch(row['html'] or ''):
+        return False
+
+    def work(conn):
+        if not select_folder(conn, folder, readonly=True, acc=acc):
+            return False
+        data = fetch_body_parts(acc, folder, uid, conn,
+                               max_section_bytes=PREFETCH_SECTION_MAX_BYTES)
+        if data is None:
+            return False
+        _store_body(acc, folder, uid, data)
+        imap_log(acc, 'PREFETCH ok', folder, uid)
+        return True
+
+    return with_imap(acc, work, priority=priority)
+
+
+def queue_body_prefetch(acc, folder, uids, limit=BODY_PREFETCH_LIMIT):
+    """新邮件一到就叫它：后台把最新几封的正文先存好，之后点开就是秒开。"""
+    if is_demo_account(acc) or not uids:
+        return
+    ids = sorted({uid_int(u) for u in uids if uid_int(u)}, reverse=True)[:limit]
+    if not ids:
+        return
+    key = (acc['id'], folder or 'INBOX')
+    with _prefetch_guard:
+        if key in _prefetch_running:
+            return
+        _prefetch_running.add(key)
+
+    def run():
+        try:
+            for u in ids:
+                # 用户正在等操作就先让路：别抢那条唯一的账号连接
+                if sync_queue.worker_for(acc['id']).pending(max_priority=sync_queue.PRIORITY_CURRENT):
+                    break
+                try:
+                    prefetch_body(acc, folder, str(u))
+                except Exception as e:
+                    imap_log(acc, 'PREFETCH err', folder, u, type(e).__name__, e)
+                    break
+        finally:
+            with _prefetch_guard:
+                _prefetch_running.discard(key)
+
+    threading.Thread(target=run, daemon=True, name='body-prefetch-%s' % acc['id']).start()
 
 
 def row_to_message(row, acc):
@@ -4145,6 +5056,19 @@ def mark_local(acc_id, folder, uid, **fields):
     stats_bump()
 
 
+def mark_read_now(acc, folder, uid):
+    """点开就算已读：先写本地库 + 排队推送，和"正文有没有取到"彻底解耦。
+
+    以前是"正文下载成功之后"才标已读，一旦取正文超时/失败，这一步就被跳过，
+    界面上红点过一会儿又冒出来，看起来像"没读成功"。
+    """
+    try:
+        mark_local(acc['id'], folder, uid, unread=0, pending_sync='seen')
+        enqueue_job(acc['id'], 'seen', folder, uid)
+    except Exception as e:
+        imap_log(acc, 'mark read err', folder, uid, type(e).__name__, e)
+
+
 def drain_jobs(acc):
     db = get_db()
     jobs = [dict(r) for r in db.execute(
@@ -4175,7 +5099,8 @@ def drain_jobs(acc):
                     move_mail(conn, folder, uid, (dest, 'INBOX', 'Inbox', '收件箱'))
                 return True
 
-            with_imap(acc, work)
+            # 推送"已读/星标"这类善后工作排到后台：别和用户下一次点击抢同一条连接
+            with_imap(acc, work, priority=sync_queue.PRIORITY_BACKGROUND)
             add_tombstone(acc['id'], job['folder'] or 'INBOX', job['uid']) if job['kind'] in ('delete', 'purge') else None
             clear_pending(acc['id'], job['folder'] or 'INBOX', job['uid'])
             db = get_db()
@@ -4193,6 +5118,7 @@ def drain_jobs(acc):
 
 
 def prefetch_unread_bodies(acc, folder, limit=8):
+    """打开文件夹时，把最近几封未读的正文在后台补齐（只取文本、不含附件）。"""
     db = get_db()
     rows = db.execute(
         """SELECT folder, uid FROM mails
@@ -4203,10 +5129,10 @@ def prefetch_unread_bodies(acc, folder, limit=8):
     db.close()
     for r in rows:
         try:
-            # 用户正在等某个操作时先让路：这几封正文不值得挡住"打开收件箱"。
+            # 用户正在等某个操作时先让路：这几封正文不值得挡住"打开收件箱"
             if sync_queue.worker_for(acc['id']).pending(max_priority=sync_queue.PRIORITY_USER):
                 break
-            fetch_one_body(acc, r['folder'], r['uid'], priority=sync_queue.PRIORITY_BACKGROUND)
+            prefetch_body(acc, r['folder'], r['uid'])
         except Exception:
             break
 
@@ -4241,7 +5167,7 @@ def background_sync(acc, folder=None, force=True):
                     sync_folder_headers(acc, fol, limit=FIRST_BATCH,
                                         priority=sync_queue.PRIORITY_BACKGROUND)
                     backfill_missing_dates(acc, fol)
-            prefetch_unread_bodies(acc, folder if folder and folder != STARRED_ID else 'INBOX', limit=12)
+            prefetch_unread_bodies(acc, folder if folder and folder != STARRED_ID else 'INBOX', limit=8)
         except Exception as e:
             push_sync_error('同步失败：' + str(e))
         finally:
@@ -4434,16 +5360,23 @@ def api_mail():
     if folder == STARRED_ID:
         folder = 'INBOX'
     row = load_mail_row(acc['id'], folder, uid)
+    # 点开就是已读：先记下来，再去取正文
+    mark_read_now(acc, folder, uid)
     if row and row.get('has_body') and not html_needs_refetch(row.get('html') or ''):
-        mark_local(acc['id'], folder, uid, unread=0, pending_sync='seen')
-        enqueue_job(acc['id'], 'seen', folder, uid)
         background_sync(acc, folder)
         return jsonify(row_to_message(row, acc))
-    data = fetch_one_body(acc, folder, uid)
+    try:
+        data = fetch_one_body(acc, folder, uid)
+    except Exception as e:
+        imap_log(acc, 'MAIL body err', folder, uid, type(e).__name__, e)
+        push_sync_error('正文加载失败：' + body_error_text(e))
+        data = None
     if not data:
-        abort(make_response(jsonify({'error': '邮件不存在'}), 404))
-    mark_local(acc['id'], folder, uid, unread=0, pending_sync='seen')
-    enqueue_job(acc['id'], 'seen', folder, uid)
+        if not row:
+            abort(make_response(jsonify({'error': '邮件不存在'}), 404))
+        # 正文没取到：至少把这封邮件本身给界面（已读状态已经生效）
+        background_sync(acc, folder)
+        return jsonify(row_to_message(row, acc))
     background_sync(acc, folder)
     return jsonify(data)
 
@@ -4469,19 +5402,39 @@ def api_thread():
             pairs.append((folder, uid))
     if not pairs:
         return jsonify({'messages': []})
+    # 点开就算已读：先把整个会话记成已读，正文取不取得到都不影响这件事
+    for fol, uid in pairs:
+        mark_read_now(acc, fol, uid)
+    # 会话很长时，先只给最新一封（首屏秒出），其余由前端接着取
+    part = (request.args.get('part') or '').strip().lower()
+    if part == 'newest':
+        pairs = pairs[-1:]
+    elif part == 'older':
+        pairs = pairs[:-1]
+    if not pairs:
+        return jsonify({'messages': [], 'folder': folder, 'errors': []})
+    # 补齐更早的会话内容是后台活儿：别占用"用户正在等"的队列优先级
+    body_priority = sync_queue.PRIORITY_BACKGROUND if part == 'older' else None
     messages = []
     for fol, uid in pairs:
         row = load_mail_row(acc['id'], fol, uid)
-        if row and row.get('has_body') and not html_needs_refetch(row.get('html') or ''):
+        data = None
+        try:
+            if row and row.get('has_body') and not html_needs_refetch(row.get('html') or ''):
+                messages.append(row_to_message(row, acc))
+                continue
+            data = fetch_one_body(acc, fol, uid, priority=body_priority)
+        except Exception as e:
+            imap_log(acc, 'THREAD body err', fol, uid, type(e).__name__, e)
+            push_sync_error('正文加载失败：' + body_error_text(e))
+        if data:
+            messages.append(data)
+        elif row:
+            # 正文暂时取不到：这封邮件也要出现在会话里，不能凭空消失
             messages.append(row_to_message(row, acc))
-        else:
-            data = fetch_one_body(acc, fol, uid)
-            if data:
-                messages.append(data)
-        mark_local(acc['id'], fol, uid, unread=0, pending_sync='seen')
-        enqueue_job(acc['id'], 'seen', fol, uid)
     messages.sort(key=mail_timestamp)
-    background_sync(acc, folder)
+    if part != 'older':
+        background_sync(acc, folder)
     return jsonify({'messages': messages, 'folder': folder, 'errors': pop_sync_errors()})
 
 
@@ -4498,8 +5451,32 @@ def api_attachment():
     acc = require_account()
     uid = request.args.get('uid')
     idx = request.args.get('idx', type=int)
+    part_no = (request.args.get('part') or '').strip()
+    part_name = (request.args.get('name') or '').strip() or 'attachment'
     folder = request.args.get('folder') or 'INBOX'
 
+    if part_no:
+        # 只取这一个附件（不再把整封邮件拖下来），顺便从结构里拿它的传输编码
+        def work(conn):
+            if not select_folder(conn, folder, readonly=True):
+                return None
+            structure, _flags = imap_fetch_structure(conn, uid)
+            encoding = ''
+            for p in imap_structure_parts(parse_imap_tokens(structure)):
+                if p['part'] == part_no:
+                    encoding = p['encoding']
+                    break
+            blob = imap_fetch_sections(conn, uid, [part_no]).get(part_no)
+            if blob is None:
+                return None
+            return decode_section(blob, encoding)
+
+        payload = with_imap(acc, work)
+        if payload is None:
+            abort(404)
+        return send_file(io.BytesIO(payload), as_attachment=True, download_name=part_name)
+
+    # 老格式（早期存下的附件信息只有 idx）：保持兼容
     def work(conn):
         if not select_folder(conn, folder, readonly=True):
             return None
@@ -5349,12 +6326,13 @@ _idle_manager_stop = threading.Event()
 _idle_manager_thread = None
 
 
-def _push_notification(acc_id, email, count):
+def _push_notification(acc_id, email, count, uids=None):
     with _notify_lock:
         _pending_notifications.append({
             'acc_id': acc_id,
             'email': email or '',
             'count': count,
+            'uids': [uid_text(u) for u in (uids or [])][:50],
             'ts': time.time(),
         })
         if len(_pending_notifications) > 50:
@@ -5394,11 +6372,18 @@ def notify_new_mail(acc, folder, uids, baseline=None):
         count = len([u for u in uids if uid_int(u) > seen])
         _notified_uid[key] = max_uid
 
-    _push_notification(acc['id'], acc.get('email') or '', max(1, count))
+    _push_notification(acc['id'], acc.get('email') or '', max(1, count), uids=uids)
     publish('newmail', acc=acc['id'], email=acc.get('email') or '', folder=folder,
-            count=max(1, count), uids=[str(u) for u in uids][:50])
+            count=max(1, count), uids=[uid_text(u) for u in uids][:50])
     imap_log(acc, 'NOTIFY new', folder, 'count', count)
     return True
+
+
+def uid_text(u):
+    """把 IMAP 回来的 uid（可能是 bytes）统一成干净的数字字符串。"""
+    if isinstance(u, (bytes, bytearray)):
+        return bytes(u).decode('ascii', 'ignore').strip()
+    return str(u).strip()
 
 
 def announce_new_mail(acc, folder, uids):
@@ -5412,6 +6397,8 @@ def announce_new_mail(acc, folder, uids):
     publish('mail', acc=acc['id'], email=acc.get('email') or '',
             folder=folder or 'INBOX', count=len(uids),
             last_uid=max((uid_int(u) for u in uids), default=0))
+    # 邮件头已经落库，紧接着把最新几封的正文在后台存好（不阻塞、不带附件）
+    queue_body_prefetch(acc, folder or 'INBOX', uids)
 
 
 def imap_idle_begin(conn):
@@ -5899,13 +6886,16 @@ def api_sync_status():
             'last_sync_ago': int(now - last_sync) if last_sync else None,
             'last_event': live.get('last_event') or '',
             'last_error': live.get('last_error') or '',
+            'route': host_route(acc.get('imap_host') or ''),
             'poll_interval': poll_interval_for(acc) if aid not in _idle_threads else 0,
             'uidvalidity': int(state.get('uidvalidity') or 0),
             'uidnext': int(state.get('uidnext') or 0),
             'last_uid': int(state.get('last_uid') or 0),
             'unread': folder_unread_count(aid, 'INBOX'),
         })
-    return jsonify({'mode': sync_mode(), 'accounts': accounts})
+    proxy = system_proxy()
+    return jsonify({'mode': sync_mode(), 'accounts': accounts,
+                    'proxy': proxy, 'proxy_active': bool(_parse_proxy(proxy))})
 
 
 _quiet_sync_error_logs()
