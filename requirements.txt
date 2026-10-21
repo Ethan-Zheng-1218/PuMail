@@ -1,6 +1,2 @@
-# 运行时依赖 / Runtime
+# Runtime dependencies
 flask
-
-# 仅打包时需要 / Needed only when packaging (electron/build.bat)
-pillow
-pyinstaller

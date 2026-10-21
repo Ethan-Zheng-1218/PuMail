@@ -1,0 +1,4 @@
+# Windows packaging dependencies (includes runtime)
+-r ../requirements.txt
+pillow
+pyinstaller

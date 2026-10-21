@@ -1,25 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
+from pathlib import Path
+
+ROOT = Path(SPECPATH).resolve().parent
+
 a = Analysis(
-    ['server.py'],
-    pathex=[],
+    [str(ROOT / 'backend' / 'server.py')],
+    pathex=[str(ROOT / 'backend')],
     binaries=[],
-    datas=[
-        ('index.html', '.'),
-        ('app.js', '.'),
-        ('styles.css', '.'),
-        ('privacy.html', '.'),
-        ('help.html', '.'),
-        ('guide.html', '.'),
-        ('邮箱绑定指南.md', '.'),
-        ('pumail-logo.svg', '.'),
-        ('carton1.svg', '.'),
-        ('carton4.svg', '.'),
-        ('gaia-tree.png', '.'),
-        ('notice14.mp3', '.'),
-        ('guide-images', 'guide-images'),
-    ],
+    datas=[(str(ROOT / 'frontend'), 'frontend')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -41,7 +31,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
-    icon='electron/build/icon.ico',
+    icon=str(ROOT / 'packaging' / 'generated' / 'icon.ico'),
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

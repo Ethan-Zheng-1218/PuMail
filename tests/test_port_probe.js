@@ -2,14 +2,15 @@
  * 验证 electron/main.js 里的 probeBackend()：它决定打包版是"用现成的后端"还是"自己启动一个"。
  * 直接从源码里取出真实函数来测，不复制代码，避免测的和跑的不是同一份。
  *
- * 运行：node test_port_probe.js
+ * 运行：node tests/test_port_probe.js
  */
 
 const fs = require('fs');
+const path = require('path');
 const http = require('http');
 
 async function main() {
-  const src = fs.readFileSync('electron/main.js', 'utf8');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.js'), 'utf8');
 
   // 取出 probeBackend 的源码：从函数开头，到第一行顶格的 '}' 为止
   const start = src.indexOf('function probeBackend()');

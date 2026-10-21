@@ -702,7 +702,7 @@ function applyBootSeed(boot) {
 function playNoticeSound() {
   if (!state.noticeSound) return;
   try {
-    const audio = new Audio(location.origin + '/notice14.mp3');
+    const audio = new Audio(location.origin + '/assets/notice14.mp3');
     audio.volume = 0.6;
     audio.addEventListener('error', () => {
       toast('提示音文件加载失败，请检查 notice14.mp3 是否存在');

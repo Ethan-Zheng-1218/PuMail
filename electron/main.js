@@ -3,6 +3,7 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
+const { pathToFileURL } = require('url');
 
 // 打包版用独立端口（5211），网页预览版仍然是 5000：两者可以同时存在，互不干扰。
 // 以前两边都用 5000，打包版一看到有人在应答就直接用它，结果连到了旧代码的服务上。
@@ -85,26 +86,26 @@ ipcMain.handle('open-external', async (_e, url) => {
 ipcMain.handle('open-local-page', async (_e, name) => {
   if (typeof name !== 'string' || !name) return { ok: false };
   const base = app.isPackaged
-    ? path.join(process.resourcesPath, 'pumail-server')
-    : path.join(path.resolve(__dirname, '..'), 'dist', 'PuMail', '_internal');
+    ? path.join(process.resourcesPath, 'pumail-server', '_internal', 'frontend')
+    : path.join(path.resolve(__dirname, '..'), 'dist', 'PuMail', '_internal', 'frontend');
   const filePath = path.join(base, name);
   if (!fs.existsSync(filePath)) return { ok: false, error: 'File not found: ' + filePath };
 
   // 对 guide.html，将 markdown 内容内嵌注入以避免 file:// 下 fetch 被阻止
   if (name === 'guide.html') {
     try {
-      const mdPath = path.join(base, '邮箱绑定指南.md');
+      const mdPath = path.join(base, 'guides', '邮箱绑定指南.md');
       let html = fs.readFileSync(filePath, 'utf8');
       // 将相对路径的 CSS 引用改为绝对 file:// 路径，以便临时文件也能加载样式
-      const cssAbsUrl = 'file://' + path.join(base, 'styles.css').replace(/\\/g, '/');
+      const cssAbsUrl = pathToFileURL(path.join(base, 'styles.css')).href;
       html = html.replace(/href="styles\.css[^"]*"/, 'href="' + cssAbsUrl + '"');
       // 将返回用户手册链接改为绝对路径
-      const helpAbsUrl = 'file://' + path.join(base, 'help.html').replace(/\\/g, '/');
+      const helpAbsUrl = pathToFileURL(path.join(base, 'help.html')).href;
       html = html.replace('href="help.html"', 'href="' + helpAbsUrl + '"');
       if (fs.existsSync(mdPath)) {
         let md = fs.readFileSync(mdPath, 'utf8');
         // 将 markdown 中的相对图片路径转为绝对 file:// 路径
-        const imgBase = 'file://' + (base.replace(/\\/g, '/'));
+        const imgBase = pathToFileURL(path.join(base, 'guides')).href;
         md = md.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, src) => {
           if (src.startsWith('http://') || src.startsWith('https://') || src.startsWith('file://')) return match;
           return '![' + alt + '](' + imgBase + '/' + src + ')';
@@ -114,7 +115,7 @@ ipcMain.handle('open-local-page', async (_e, name) => {
       }
       const tmpPath = path.join(require('os').tmpdir(), 'pumail-guide.html');
       fs.writeFileSync(tmpPath, html, 'utf8');
-      const fileUrl = 'file://' + tmpPath.replace(/\\/g, '/');
+      const fileUrl = pathToFileURL(tmpPath).href;
       await shell.openExternal(fileUrl);
       return { ok: true };
     } catch (err) {
@@ -122,7 +123,7 @@ ipcMain.handle('open-local-page', async (_e, name) => {
     }
   }
 
-  const fileUrl = 'file://' + filePath.replace(/\\/g, '/');
+  const fileUrl = pathToFileURL(filePath).href;
   await shell.openExternal(fileUrl);
   return { ok: true };
 });
@@ -167,9 +168,9 @@ function serverExe() {
 
 function iconFile() {
   const packedIco = path.join(process.resourcesPath, 'icon.ico');
-  const localIco = path.join(__dirname, '..', 'cat.ico');
+  const localIco = path.join(__dirname, '..', 'packaging', 'assets', 'cat.ico');
   const packedPng = path.join(process.resourcesPath, 'icon.png');
-  const localPng = path.join(__dirname, 'build', 'icon.png');
+  const localPng = path.join(__dirname, '..', 'packaging', 'generated', 'icon.png');
   if (app.isPackaged && fs.existsSync(packedIco)) return packedIco;
   if (fs.existsSync(localIco)) return localIco;
   if (app.isPackaged && fs.existsSync(packedPng)) return packedPng;
