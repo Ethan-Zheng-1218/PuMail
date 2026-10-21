@@ -38,16 +38,16 @@
         ]
       },
       {
-        "from": "build/icon.png",
+        "from": "../packaging/generated/icon.png",
         "to": "icon.png"
       },
       {
-        "from": "../cat.ico",
+        "from": "../packaging/assets/cat.ico",
         "to": "icon.ico"
       }
     ],
     "win": {
-      "icon": "../cat.ico",
+      "icon": "../packaging/assets/cat.ico",
       "target": "nsis",
       "signAndEditExecutable": false
     },
@@ -59,12 +59,12 @@
       "createStartMenuShortcut": false,
       "shortcutName": "PuMail",
       "artifactName": "PuMail-Setup.exe",
-      "include": "build/installer.nsh",
-      "installerIcon": "../cat.ico",
-      "uninstallerIcon": "../cat.ico",
-      "installerSidebar": "build/sidebar.bmp",
-      "uninstallerSidebar": "build/sidebar.bmp",
-      "installerHeader": "build/header.bmp"
+      "include": "../packaging/installer.nsh",
+      "installerIcon": "../packaging/assets/cat.ico",
+      "uninstallerIcon": "../packaging/assets/cat.ico",
+      "installerSidebar": "../packaging/generated/sidebar.bmp",
+      "uninstallerSidebar": "../packaging/generated/sidebar.bmp",
+      "installerHeader": "../packaging/generated/header.bmp"
     }
   },
   "allowScripts": {}

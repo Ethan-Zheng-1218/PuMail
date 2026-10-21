@@ -38,7 +38,7 @@
         const bits = [];
         s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, alt, src) => {
           const i = bits.length;
-          bits.push(`<img src="${src}" alt="${escapeHtml(alt)}" loading="lazy" />`);
+          bits.push(`<img src="${new URL(src, new URL('guides/', document.baseURI)).href}" alt="${escapeHtml(alt)}" loading="lazy" />`);
           return `\u0000IMG${i}\u0000`;
         });
         s = s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, text, href) => {
@@ -131,13 +131,13 @@
         try {
           let md = window.__GUIDE_MD__;
           if (!md) {
-            const r = await fetch(encodeURI('邮箱绑定指南.md'), { credentials: 'same-origin' });
+            const r = await fetch(encodeURI('guides/邮箱绑定指南.md'), { credentials: 'same-origin' });
             if (!r.ok) throw new Error('not found');
             md = await r.text();
           }
           box.innerHTML = renderMarkdown(md);
         } catch (err) {
-          box.innerHTML = '<p>未能载入操作指南，请确认 <code>邮箱绑定指南.md</code> 与应用在同一目录。</p>';
+          box.innerHTML = '<p>未能载入操作指南，请确认 <code>guides/邮箱绑定指南.md</code> 存在。</p>';
         }
       })();
     </script>

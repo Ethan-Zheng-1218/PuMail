@@ -3,7 +3,7 @@
 PuMail 后端 API 服务器（多账号真实邮箱接入）
 功能：多账号管理 / 文件夹列表 / 收信列表 / 读信 / 发信 / 草稿 / 星标 / 归档 / 删除 / 搜索
 依赖：pip install flask
-运行：python server.py  → 浏览器打开 http://127.0.0.1:5000
+运行：python -m backend.server  → 浏览器打开 http://127.0.0.1:5000
 """
 
 import base64
@@ -11,7 +11,10 @@ import hashlib
 import hmac
 import html as html_mod
 import imaplib
-import sync_queue
+if __package__:
+    from . import sync_queue
+else:
+    import sync_queue
 import io
 import json
 import logging
@@ -68,14 +71,14 @@ from flask import (Flask, Response, abort, jsonify, make_response, request,
 
 def _resource_dir():
     if getattr(sys, 'frozen', False):
-        return sys._MEIPASS
-    return os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(sys._MEIPASS, 'frontend')
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'frontend')
 
 
 def _install_dir():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 BASE_DIR = _resource_dir()
@@ -3331,7 +3334,7 @@ def static_files(filename):
     # guide.html 需要注入 markdown 内容（避免 file:// 下 fetch 被阻止）
     if filename == 'guide.html':
         filepath = os.path.join(BASE_DIR, 'guide.html')
-        md_path = os.path.join(BASE_DIR, '邮箱绑定指南.md')
+        md_path = os.path.join(BASE_DIR, 'guides', '邮箱绑定指南.md')
         if os.path.exists(filepath) and os.path.exists(md_path):
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:

@@ -2,7 +2,7 @@ import tempfile
 import time
 import unittest
 
-import server
+from backend import server
 
 
 class UnreadCountTests(unittest.TestCase):

@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 
-import server
+from backend import server
 
 
 class _FakeSocks5(socket.socket):
