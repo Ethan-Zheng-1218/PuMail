@@ -55,7 +55,7 @@ function fixture() {
     CSS: { escape: String }, localStorage: { getItem: () => null },
     window: { pumailAPI: bridge },
     document: { getElementById: element, querySelector: () => null, querySelectorAll: () => [] } });
-  const source = fs.readFileSync('app.js', 'utf8').replace(
+  const source = fs.readFileSync('frontend/app.js', 'utf8').replace(
     /applyTheme\(currentTheme\(\)\);\s*bindEvents\(\);\s*startApp\(\);\s*$/, '');
   vm.runInContext(source + '\nglobalThis.testState = state;', ui);
   ui.renderAccountBar = () => {};

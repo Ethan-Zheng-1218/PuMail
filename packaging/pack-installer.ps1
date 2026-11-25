@@ -1,7 +1,7 @@
 param([string]$ConfigPath)
 $ErrorActionPreference = 'Stop'
-$electronRoot = Split-Path $PSScriptRoot -Parent
-$repoRoot = Split-Path $electronRoot -Parent
+$repoRoot = Split-Path $PSScriptRoot -Parent
+$electronRoot = Join-Path $repoRoot 'electron'
 $package = Get-Content -LiteralPath (Join-Path $electronRoot 'package.json') -Raw | ConvertFrom-Json
 if ($ConfigPath) {
     $config = Get-Content -LiteralPath (Resolve-Path -LiteralPath $ConfigPath).Path -Raw | ConvertFrom-Json

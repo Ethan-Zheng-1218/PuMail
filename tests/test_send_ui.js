@@ -24,7 +24,7 @@ function fixture() {
       createElement: () => ({ dataset: {}, appendChild() {} }) },
     window: {}, console, setTimeout, clearTimeout, URLSearchParams,
   });
-  const src = fs.readFileSync('app.js', 'utf8').replace(
+  const src = fs.readFileSync('frontend/app.js', 'utf8').replace(
     /applyTheme\(currentTheme\(\)\);\s*bindEvents\(\);\s*startApp\(\);\s*$/, '');
   vm.runInContext(src + '\nglobalThis.testState = state;', context);
   context.realApi = context.api;

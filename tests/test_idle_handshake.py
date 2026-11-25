@@ -1,12 +1,13 @@
 """验证 IMAP 待机（IDLE）握手：不连真实邮箱，用一个假的 IMAP 服务器来测。
 
-直接运行：.venv\\Scripts\\python.exe test_idle_handshake.py
+直接运行：python -m tests.test_idle_handshake
 
 测的是 server.py 里的三个函数：imap_idle_begin / imap_idle_wait / imap_idle_end。
 它们用 ast 从源码里取出来单独执行，不会启动整个应用、也不碰数据库。
 """
 
 import ast
+from pathlib import Path
 import imaplib
 import select
 import socket
@@ -16,7 +17,7 @@ import time
 
 def load_functions(names):
     """把 server.py 里指定的函数取出来，放进一个独立的命名空间。"""
-    with open('server.py', encoding='utf-8') as f:
+    with (Path(__file__).resolve().parents[1] / 'backend' / 'server.py').open(encoding='utf-8') as f:
         tree = ast.parse(f.read(), filename='server.py')
     # 注意：待机函数里用到了 imaplib 和 select，两者都要放进执行命名空间，
     # 少一个就会走进异常分支、表现为"收不到推送"。

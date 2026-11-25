@@ -8,25 +8,13 @@ tls_policy = Path(ssl.__file__).with_name('codex-rejected-cas.pem')
 tls_data = [(str(tls_policy), '.')] if tls_policy.is_file() else []
 
 
+ROOT = Path(SPECPATH).resolve().parent
+
 a = Analysis(
-    ['server.py'],
-    pathex=[],
+    [str(ROOT / 'backend' / 'server.py')],
+    pathex=[str(ROOT / 'backend')],
     binaries=[],
-    datas=[
-        ('index.html', '.'),
-        ('app.js', '.'),
-        ('styles.css', '.'),
-        ('privacy.html', '.'),
-        ('help.html', '.'),
-        ('guide.html', '.'),
-        ('邮箱绑定指南.md', '.'),
-        ('pumail-logo.svg', '.'),
-        ('carton1.svg', '.'),
-        ('carton4.svg', '.'),
-        ('gaia-tree.png', '.'),
-        ('notice14.mp3', '.'),
-        ('guide-images', 'guide-images'),
-    ] + tls_data,
+    datas=[(str(ROOT / 'frontend'), 'frontend')] + tls_data,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -48,7 +36,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
-    icon='electron/build/icon.ico',
+    icon=str(ROOT / 'packaging' / 'generated' / 'icon.ico'),
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

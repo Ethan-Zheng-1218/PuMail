@@ -108,7 +108,7 @@ function fixture() {
     setTimeout: () => 0,
     clearTimeout: () => {},
   });
-  const src = fs.readFileSync(process.env.PUMAIL_APP_JS || 'app.js', 'utf8').replace(
+  const src = fs.readFileSync(process.env.PUMAIL_APP_JS || 'frontend/app.js', 'utf8').replace(
     /applyTheme\(currentTheme\(\)\);\s*bindEvents\(\);\s*startApp\(\);\s*$/, '');
   vm.runInContext(src, context);
   context.toast = () => {};

@@ -1,5 +1,6 @@
 ﻿$ErrorActionPreference = 'Stop'
-Set-Location -LiteralPath $PSScriptRoot
+$projectRoot = Split-Path -Parent $PSScriptRoot
+Set-Location -LiteralPath $projectRoot
 try {
     $listener = Get-NetTCPConnection -LocalPort 5000 -State Listen -ErrorAction SilentlyContinue
     if ($listener) {
@@ -10,8 +11,8 @@ try {
     }
 
     $candidates = @(
-        (Join-Path $PSScriptRoot '.venv\Scripts\python.exe'),
-        (Join-Path $PSScriptRoot 'venv\Scripts\python.exe')
+        (Join-Path $projectRoot '.venv\Scripts\python.exe'),
+        (Join-Path $projectRoot 'venv\Scripts\python.exe')
     )
     foreach ($name in @('python', 'py')) {
         $command = Get-Command $name -ErrorAction SilentlyContinue
@@ -29,14 +30,14 @@ try {
         }
     }
     if (-not $pythonPath) {
-        throw '未找到带 Flask 的 Python。请安装 Python 并运行 python -m pip install flask 后重试。'
+        throw '未找到带 Flask 的 Python。请安装 Python 并运行 python -m pip install -r requirements.txt 后重试。'
     }
 
     Write-Host 'PuMail 网页预览：http://127.0.0.1:5000'
     Write-Host '请保留此窗口。修改 HTML/CSS/JS 后，在浏览器按 Ctrl+F5 刷新。'
-    Write-Host '修改 server.py 后，关闭此窗口再双击启动。关闭窗口即可停止服务。'
+    Write-Host '修改 backend/server.py 后，关闭此窗口再双击启动。关闭窗口即可停止服务。'
     Remove-Item Env:PUMAIL_NO_BROWSER -ErrorAction SilentlyContinue
-    & $pythonPath (Join-Path $PSScriptRoot 'server.py')
+    & $pythonPath (Join-Path $projectRoot 'backend\server.py')
     if ($LASTEXITCODE -ne 0) { throw "服务退出，退出码：$LASTEXITCODE" }
 } catch {
     Write-Host "启动失败：$_" -ForegroundColor Red

@@ -1,13 +1,13 @@
 """sync_queue 的单元测试：串行、优先级、异常传递、同线程重入。
 
-直接运行：.venv\\Scripts\\python.exe test_sync_queue.py
+直接运行：python -m tests.test_sync_queue
 也可以用 pytest。
 """
 
 import threading
 import time
 
-import sync_queue
+from backend import sync_queue
 
 
 def test_serialized_no_overlap():

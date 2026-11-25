@@ -6,7 +6,7 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
-import server
+from backend import server
 
 
 class AccountSendTests(unittest.TestCase):

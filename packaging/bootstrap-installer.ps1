@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 $payloadFile = (Resolve-Path -LiteralPath $PayloadPath).Path
 $outputFile = [IO.Path]::GetFullPath($OutputPath)
 if ($payloadFile -eq $outputFile) { throw 'Payload and output must have different paths' }
-$repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+$repoRoot = Split-Path $PSScriptRoot -Parent
 $version = (Get-Content -LiteralPath (Join-Path $repoRoot 'electron\package.json') -Raw | ConvertFrom-Json).version
 $compiler = Join-Path ([Environment]::GetFolderPath('Windows')) 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path -LiteralPath $compiler)) { throw '.NET Framework C# compiler is unavailable' }
@@ -25,7 +25,7 @@ internal static class InstallerPayload { internal const string Sha256 = "$payloa
 "@
 [IO.File]::WriteAllText($generatedFile, $generatedSource, [Text.UTF8Encoding]::new($false))
 & $compiler /nologo /target:winexe /platform:anycpu /optimize+ "/out:$outputFile" `
-    "/win32icon:$(Join-Path $repoRoot 'cat.ico')" "/win32manifest:$(Join-Path $PSScriptRoot 'installer-bootstrap.manifest')" `
+    "/win32icon:$(Join-Path $repoRoot 'packaging/assets/cat.ico')" "/win32manifest:$(Join-Path $PSScriptRoot 'installer-bootstrap.manifest')" `
     /reference:System.Windows.Forms.dll "/resource:$payloadFile,PuMail.Installer" `
     (Join-Path $PSScriptRoot 'installer-bootstrap.cs') $generatedFile
 if ($LASTEXITCODE -ne 0) { throw "Installer bootstrap compilation failed: $LASTEXITCODE" }

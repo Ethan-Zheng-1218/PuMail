@@ -1,6 +1,6 @@
 """收信链路的回归测试：不联网，用假 IMAP 连接和假同步函数。
 
-直接运行：.venv\\Scripts\\python.exe -m unittest test_receive_pipeline
+直接运行：python -m unittest tests.test_receive_pipeline
 """
 
 import sqlite3
@@ -10,7 +10,7 @@ import time
 import unittest
 import re
 
-import server
+from backend import server
 
 
 class _FakeConn(object):
