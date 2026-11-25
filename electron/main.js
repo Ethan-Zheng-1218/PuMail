@@ -151,6 +151,7 @@ ipcMain.handle('clear-taskbar-flash', async () => {
     _flashTimer = null;
   }
   if (window) window.flashFrame(false);
+  stopTrayBlink();
   return { ok: true };
 });
 

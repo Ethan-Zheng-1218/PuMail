@@ -17,6 +17,22 @@ InstProgressFlags smooth
 ; -- 仅在安装器中定义（不影响卸载器）--
 !ifndef BUILD_UNINSTALLER
 
+  ; Internal startup check: exercise NSIS plugin extraction without installing.
+  ; The bootstrap supplies /D= inside its isolated workspace for this mode.
+  !macro preInit
+    ReadEnvStr $0 "PUMAIL_INSTALLER_CHECK"
+    ${if} $0 == "1"
+      InitPluginsDir
+      System::Call 'kernel32::GetCurrentProcessId() i .r0'
+      ReadEnvStr $1 "PUMAIL_INSTALLER_WORKSPACE"
+      FileOpen $0 "$1\startup-ok.txt" w
+      FileWrite $0 "PuMail installer ready"
+      FileClose $0
+      SetErrorLevel 0
+      Quit
+    ${endIf}
+  !macroend
+
   Var keepStartMenuShortcut
   Var keepInstaller
   Var _tmp_state
@@ -67,6 +83,12 @@ InstProgressFlags smooth
     ${endIf}
 
     ${if} $keepInstaller != ${BST_CHECKED}
+      ReadEnvStr $1 "PUMAIL_INSTALLER_WORKSPACE"
+      ${if} $1 != ""
+        ; Ask the bootstrap to delete the original download after it exits.
+        FileOpen $0 "$1\delete-source.flag" w
+        FileClose $0
+      ${else}
       ; 安装器进程退出前无法删除自身，使用短路径并持续重试。
       GetFullPathName /SHORT $1 "$EXEPATH"
       Delete "$TEMP\pumail_cleanup.bat"
@@ -92,6 +114,7 @@ InstProgressFlags smooth
       FileClose $0
       ; 通过 cmd 启动，避免直接 Exec .bat 在不同 Windows 关联设置下失效。
       Exec '"$SYSDIR\cmd.exe" /C ""$TEMP\pumail_cleanup.bat""'
+      ${endif}
     ${endIf}
   !macroend
 

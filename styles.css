@@ -604,6 +604,15 @@ html:not(.theme-light) .refresh-btn img {
 .reply-bubble *:not(small) {
   font-family: var(--mail-body-font) !important;
 }
+.thread-msg-body a.mail-link {
+  color: #10b981;
+  text-decoration: underline;
+  word-break: break-all;
+  cursor: pointer;
+}
+.thread-msg-body a.mail-link:hover { color: #34d399; }
+html.theme-light .thread-msg-body a.mail-link { color: #2563eb; }
+html.theme-light .thread-msg-body a.mail-link:hover { color: #1d4ed8; }
 #threadView.is-chat .thread-msg {
   width: 80%;
   max-width: 80%;
@@ -656,7 +665,9 @@ html:not(.theme-light) .refresh-btn img {
 .ctx-menu button svg { flex-shrink: 0; }
 .ctx-menu button:hover { background: #3d4451; color: #fff; }
 .atts { margin-top: 16px; border-top: 1px dashed #3d4451; padding-top: 10px; display: flex; flex-wrap: wrap; gap: 10px; }
-.atts a { color: #10b981; text-decoration: none; }
+.atts a { color: #10b981; text-decoration: none; cursor: pointer; }
+.atts a:hover { text-decoration: underline; }
+.atts a.is-downloading { opacity: .65; cursor: progress; }
 
 .reply-thread { margin-top: 24px; }
 .reply-bubble {
@@ -1013,9 +1024,6 @@ html:not(.theme-light) .refresh-btn img {
 .sync-status-mode.is-manual { color: #a4b0be; }
 .sync-status-err { color: #f28b82; font-size: 12px; }
 .thread-msg-missing { color: #a4b0be; font-style: italic; }
-.toast.is-clickable { cursor: pointer; }
-.toast.is-clickable:hover { border-color: #6a8caf; }
-.toast .toast-go { color: #7fb3e0; font-size: 12px; }
 html.theme-light .thread-msg-missing { color: #6b7280; }
 html.theme-light .sync-status-row { color: #374151; border-top-color: #e5e7eb; }
 html.theme-light .sync-status-acc small { color: #6b7280; }

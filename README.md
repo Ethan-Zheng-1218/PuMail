@@ -1,5 +1,42 @@
 # PuMail
 
+### 1.1.12
+
+- 2026-11-25 安装包重打包：EXE 自行准备可写临时目录，再启动安装向导；无需外部 CMD，不修改 Windows 的 TEMP/TMP 设置。
+- 点击“回复”后直接聚焦回复正文，保留自动填写的收件人。
+- 全部邮箱的收件箱未读数归零后，自动停止任务栏和右下角托盘图标闪烁；直接打开邮件阅读也会更新提醒，不再依赖点击托盘图标。
+- 提醒使用全部账号的完整未读汇总，不会因为当前邮箱或总览最近十天没有未读而误清除其他账号的提醒。
+
+### 1.1.11
+
+- 正文里的 http/https 网址即使只是纯文本也会自动变成可点击链接，点击后用系统默认浏览器打开；已有链接、脚本内容和网址末尾的中文标点不会被误识别。
+- 包含 1.1.10 的附件下载修复。
+
+### 1.1.10
+
+- 修复附件下载：点击附件不再被当成外链交给系统浏览器（浏览器没有本机登录状态，接口只会返回 401），改为在应用内带会话取回并保存到本地；下载中和失败都有提示，文件名沿用邮件的真实附件名。
+
+### 1.1.9
+
+- 多选模式下点击邮件行会同时勾选并打开正文；重复点击已选邮件保留勾选，取消选择仍可点击勾选框。
+
+### 1.1.8
+
+- 移除邮件阅读区的上一封/下一封箭头按钮及对应 J/K 快捷键；保留翻译、星标、置顶、回复和删除。
+
+### 1.1.7
+
+- 补齐构建运行库需要的 TLS 证书策略资源，修复安装版所有邮箱在联网前报 FileNotFoundError 的问题。
+- 本地 TLS 文件缺失不再被误报为网络或代理不通。
+- 收信状态区分“检测到代理配置”和实际连接结果。
+
+### 1.1.6
+
+- 修复 Gmail、QQ、163、126、iCloud、自定义邮箱及 Outlook 登录验证时缺少账号 ID 的错误。
+- 回复与写信显示发送状态并防止重复点击；失败保留输入，连接中断时提醒先核实发送结果。
+- 邮件发送后在后台保存已发送副本，避免等待副本保存时界面没有反馈。
+- 移除界面内“收到新邮件 / 查看”浮动提示，保留提示音和托盘提醒。
+
 A local desktop email client. Supports QQ Mail, 163, Gmail, Outlook and iCloud.
 Everything runs on your own machine: a small Python backend talks to your mail
 providers directly over IMAP / SMTP, and an Electron shell wraps it into a
@@ -88,8 +125,9 @@ connections, a temporary database and a fake IMAP server.
 ```bash
 python test_sync_queue.py
 python test_idle_handshake.py
-python -m unittest test_receive_pipeline test_unread_counts
+python run_tests.py
 node test_port_probe.js
+node --test test_send_ui.js
 ```
 
 ### Project layout

@@ -8,7 +8,7 @@
       if (localStorage.getItem('pupu_theme') === 'light') document.documentElement.classList.add('theme-light');
       document.documentElement.classList.add('booting');
     </script>
-    <link rel="stylesheet" href="styles.css?v=126" />
+    <link rel="stylesheet" href="styles.css?v=127" />
     <style>
       html.booting, html.booting body { min-width: 0 !important; }
       body.booting .app { visibility: hidden; }
@@ -122,8 +122,6 @@
                 </button>
                 <button type="button" id="starBtn">星标</button>
                 <button type="button" id="pinBtn">置顶</button>
-                <button type="button" id="prevMailBtn" title="上一封（K）" aria-label="上一封">↑</button>
-                <button type="button" id="nextMailBtn" title="下一封（J）" aria-label="下一封">↓</button>
                 <button type="button" id="replyBtn">回复</button>
                 <button type="button" id="deleteBtn">删除</button>
               </div>
@@ -240,7 +238,7 @@
         <label class="compose-attach">附件<input id="attachInput" type="file" multiple /></label>
         <footer>
           <button type="button" class="ghost" id="saveDraftBtn">存草稿</button>
-          <button type="submit">发送</button>
+          <button type="submit" id="sendComposeBtn">发送</button>
         </footer>
       </form>
     </div>
@@ -645,6 +643,6 @@
       </button>
     </div>
 
-    <script src="app.js?v=120"></script>
+    <script src="app.js?v=124"></script>
   </body>
 </html>

@@ -93,6 +93,7 @@ SECRET_PATH = os.path.join(DATA_DIR, 'pupumail.secret')
 CACHE_TTL = 600
 _mem_cache = {}
 _storage_lock = threading.Lock()
+_sent_copy_pending = set()  # 仅锁住本次进程正在归档的本地副本，重启后不遗留锁。
 
 
 def _norm_dir(path):
@@ -2041,7 +2042,7 @@ def fetch_cid_images(conn, uid, parts, html):
 
 
 # ---------- IMAP / SMTP ----------
-IMAP_CLIENT_ID = '("name" "PuMail" "version" "1.1.5" "vendor" "PuMail" "support-email" "pumail@localhost")'
+IMAP_CLIENT_ID = '("name" "PuMail" "version" "1.1.11" "vendor" "PuMail" "support-email" "pumail@localhost")'
 
 
 # ---------- 网络代理：自动跟随系统代理，用户不用管 ----------
@@ -2553,7 +2554,9 @@ def imap_send_id(conn):
 def imap_open(acc, timeout=30):
     host = acc.get('imap_host') or ''
     port = int(acc.get('imap_port') or 993)
-    if not connect_allowed(acc['id']):
+    # 绑定前的测试账号尚未入库；不要使用 None/0 共享退避状态。
+    acc_id = acc.get('id')
+    if acc_id and not connect_allowed(acc_id):
         # 刚连续失败过：先快速报错，让界面直接显示"连不上"，别再干等
         imap_log(acc, 'CONNECT skipped', host, 'reason', 'recent failures')
         raise RuntimeError('连不上 %s：网络或代理不通，稍后自动重试' % host)
@@ -2562,9 +2565,13 @@ def imap_open(acc, timeout=30):
         conn = _ProxyIMAP4SSL(host, port, timeout=min(timeout, CONNECT_TIMEOUT))
     except Exception as e:
         imap_log(acc, 'CONNECT fail', type(e).__name__, e)
-        note_connect(acc['id'], False)
+        if isinstance(e, FileNotFoundError):
+            raise RuntimeError('本地 TLS 加密资源缺失，请更新 PuMail 安装包。') from e
+        if acc_id:
+            note_connect(acc_id, False)
         raise
-    note_connect(acc['id'], True)
+    if acc_id:
+        note_connect(acc_id, True)
     route = host_route(host)
     if route:
         imap_log(acc, 'CONNECT route', host, route,
@@ -2581,6 +2588,10 @@ def imap_open(acc, timeout=30):
         imap_auth(conn, acc)
     except Exception as e:
         imap_log(acc, 'LOGIN fail', type(e).__name__, e)
+        try:
+            conn.shutdown()
+        except Exception:
+            pass
         raise
     imap_log(acc, 'LOGIN ok')
     if needs_imap_id(host):
@@ -3316,6 +3327,11 @@ def before_request():
             return None
         if request.cookies.get('pupu_ok') != APP_SECRET:
             return jsonify({'error': '未授权，请从首页打开 PuMail'}), 401
+        if request.path in ('/api/star', '/api/archive', '/api/delete', '/api/restore') and request.is_json:
+            acc = require_account()
+            uid = str((request.get_json(silent=True) or {}).get('uid') or '')
+            if (acc['id'], uid) in _sent_copy_pending:
+                return jsonify({'error': '邮件已发送，副本正在同步，请稍后再操作。'}), 409
     return None
 
 
@@ -3815,9 +3831,15 @@ def api_add_account():
         conn.logout()
     except Exception as e:
         msg = str(e)
+        if isinstance(e, OSError) or any(s in msg.lower() for s in ('timed out', '连不上', '代理')):
+            return jsonify({'error': '无法连接收信服务器，请检查网络、系统代理和 IMAP 端口后重试。'}), 400
         if pkey == 'outlook' or 'Outlook' in msg or 'mechanism is not supported' in msg.lower():
             return jsonify({'error': 'Outlook / Hotmail 已停用授权码登录，请点「用 Microsoft 登录」'}), 400
-        return jsonify({'error': f'无法登录 IMAP 服务器：{e}。请检查地址和授权码。'}), 400
+        if isinstance(e, imaplib.IMAP4.error):
+            hint = 'Gmail 需要开启两步验证并使用应用专用密码。' if pkey == 'gmail' else '请检查 IMAP 是否开启，以及邮箱地址和授权码。'
+            return jsonify({'error': '邮箱认证失败。' + hint}), 400
+        imap_log(None, 'ACCOUNT probe fail', type(e).__name__, e)
+        return jsonify({'error': '邮箱连接检查失败，请稍后重试；可在收信日志中查看原因。'}), 400
     try:
         new_id = upsert_mail_account(
             email_, name, pkey, imap_host, imap_port, smtp_host, smtp_port, starttls, password=password
@@ -5024,6 +5046,8 @@ def row_to_message(row, acc):
         atts = json.loads(row.get('attachments') or '[]')
     except Exception:
         atts = []
+    # 本地发送副本保存了附件内容；正文接口只返回下载所需的元数据。
+    atts = [{k: v for k, v in a.items() if k != 'data'} for a in atts]
     return {
         'uid': row['uid'],
         'folder': row['folder'],
@@ -5039,6 +5063,7 @@ def row_to_message(row, acc):
         'starred': bool(row.get('starred')),
         'unread': bool(row.get('unread')),
         'message_id': row.get('message_id') or '',
+        'in_reply_to': row.get('in_reply_to') or '',
         'mine': bool(row.get('mine')),
         'has_body': bool(row.get('has_body')),
     }
@@ -5455,6 +5480,17 @@ def api_attachment():
     part_name = (request.args.get('name') or '').strip() or 'attachment'
     folder = request.args.get('folder') or 'INBOX'
 
+    row = load_mail_row(acc['id'], folder, uid)
+    if row and idx is not None:
+        atts = json.loads(row.get('attachments') or '[]')
+        if 0 <= idx < len(atts) and 'data' in atts[idx]:
+            att = atts[idx]
+            payload = base64.b64decode(att['data'])
+            return send_file(io.BytesIO(payload), as_attachment=True,
+                             download_name=att.get('name') or 'attachment')
+    if str(uid or '').startswith('local-'):
+        abort(404)
+
     if part_no:
         # 只取这一个附件（不再把整封邮件拖下来），顺便从结构里拿它的传输编码
         def work(conn):
@@ -5569,8 +5605,62 @@ def api_send():
     except Exception as e:
         imap_log(acc, 'SEND fail', type(e).__name__, e)
         return jsonify({'error': f'发送失败：{e}'}), 400
-    sent_id = db_folder_label(acc['id'], '已发送')
-    saved = False
+    # SMTP 已接受邮件：保存副本失败/缓慢不能把发送结果变成失败，
+    # 否则用户会重发。后台保存仍走账号队列，避免与同步争抢 IMAP。
+    local_copy = None
+    warning = ''
+    try:
+        local_copy = save_local_sent(acc, msg, d)
+    except Exception as e:
+        imap_log(acc, 'send local copy fail', type(e).__name__, e)
+        warning = '邮件已发送，但本地副本保存失败，请核实邮箱的已发送文件夹。'
+    try:
+        threading.Thread(target=save_sent_copy_background, args=(acc, msg, dict(d), local_copy),
+                         daemon=True, name='save-sent-%s' % acc['id']).start()
+    except Exception as e:
+        imap_log(acc, 'send archive schedule fail', type(e).__name__, e)
+        if local_copy:
+            _sent_copy_pending.discard((acc['id'], local_copy[1]))
+    return jsonify({'ok': True, 'message_id': msg['Message-ID'], 'warning': warning})
+
+
+def save_sent_copy_background(acc, msg, data, local_copy=None):
+    try:
+        sync_queue.run(acc['id'], lambda: save_sent_copy(acc, msg, data, local_copy),
+                       priority=sync_queue.PRIORITY_BACKGROUND)
+    except Exception as e:
+        imap_log(acc, 'send archive fail', type(e).__name__, e)
+    finally:
+        if local_copy:
+            _sent_copy_pending.discard((acc['id'], local_copy[1]))
+
+
+def save_local_sent(acc, msg, d):
+    sent_id = db_folder_label(acc['id'], '已发送') or 'Sent'
+    uid = 'local-' + make_msgid().strip('<>')
+    upsert_headers(acc, sent_id, [{
+        'uid': uid, 'subject': d.get('subject') or '(无主题)',
+        'from': acc.get('name') or acc.get('email') or '',
+        'from_addr': acc.get('email') or '', 'date': time.strftime('%Y/%m/%d %H:%M'),
+        'to': d.get('to') or '', 'unread': False, 'starred': False, 'ts': time.time(),
+    }])
+    atts = []
+    for idx, att in enumerate(d.get('attachments') or []):
+        raw = att.get('data') or ''
+        atts.append(dict(att, idx=idx, size=len(base64.b64decode(raw))))
+    save_body(acc['id'], sent_id, uid, {
+        'body': d.get('body') or '', 'html': d.get('html') or '',
+        'to': d.get('to') or '', 'cc': d.get('cc') or '', 'attachments': atts,
+        'message_id': msg['Message-ID'], 'in_reply_to': d.get('in_reply_to') or '',
+    })
+    cache_bust(acc['id'])
+    _sent_copy_pending.add((acc['id'], uid))
+    return sent_id, uid
+
+
+def save_sent_copy(acc, msg, d, local_copy=None):
+    sent_id, local_uid = local_copy or save_local_sent(acc, msg, d)
+    conn = None
     try:
         conn = imap_open(acc)
         aliases = []
@@ -5580,26 +5670,30 @@ def api_send():
         stored = append_to(conn, msg, aliases)
         dest = stored or sent_id
         if dest and select_folder(conn, dest, readonly=True, acc=acc):
-            uids = list(imap_all_uids(conn))
+            # 按自己的 Message-ID 定位，不能假设文件夹最后一封就是刚发的邮件。
+            typ, found = conn.uid('search', None, 'HEADER', 'Message-ID', msg['Message-ID'])
+            uids = found[0].split() if typ == 'OK' and found and found[0] else []
             if uids:
-                upsert_headers(acc, sent_id or dest, fetch_header_chunk(conn, [uids[-1]]))
-                saved = True
-        conn.logout()
+                items = fetch_header_chunk(conn, [uids[-1]])
+                if items:
+                    upsert_headers(acc, dest, items)
+                    row = load_mail_row(acc['id'], sent_id, local_uid)
+                    body = row_to_message(row, acc)
+                    body['attachments'] = json.loads(row.get('attachments') or '[]')
+                    save_body(acc['id'], dest, uid_text(uids[-1]), body)
+                    # 隐藏旧副本，但保留已打开邮件里的本地附件下载链接。
+                    mark_local(acc['id'], sent_id, local_uid, local_deleted=1)
     except Exception as e:
         imap_log(acc, 'send append', e)
-    if not saved and sent_id:
-        upsert_headers(acc, sent_id, [{
-            'uid': 'local-' + str(int(time.time() * 1000)),
-            'subject': d.get('subject') or '(无主题)',
-            'from': acc.get('name') or acc.get('email') or '',
-            'from_addr': acc.get('email') or '',
-            'date': time.strftime('%Y/%m/%d %H:%M'),
-            'to': d.get('to') or '',
-            'unread': False,
-            'starred': False,
-            'ts': time.time(),
-        }])
-    return jsonify({'ok': True})
+    finally:
+        _sent_copy_pending.discard((acc['id'], local_uid))
+        if conn is not None:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+    cache_bust(acc['id'])
+    publish('mail', acc=acc['id'], folder=sent_id)
 
 
 @app.route('/api/draft', methods=['POST'])

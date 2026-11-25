@@ -29,6 +29,7 @@ const state = {
   composeAcc: null,
   noticeSound: false,
   unreadPerAccount: {},
+  sending: false,
 };
 
 const mailCache = new Map();
@@ -45,11 +46,28 @@ async function api(path, opts = {}) {
   try {
     r = await fetch(path, { credentials: 'same-origin', ...opts });
   } catch (err) {
+    if (path === '/api/send') throw sendUnconfirmedError();
     throw new Error('本地服务未连接，请重试');
   }
-  const d = await r.json().catch(() => ({}));
+  let d;
+  try {
+    d = await r.json();
+  } catch (err) {
+    if (path === '/api/send') throw sendUnconfirmedError();
+    d = {};
+  }
   if (!r.ok || d.error) throw new Error(d.error || ('请求失败 ' + r.status));
   return d;
+}
+
+function sendUnconfirmedError() {
+  const err = new Error('发送结果未确认，请先检查“已发送”或与收件方确认，避免重复发送');
+  err.uncertain = true;
+  return err;
+}
+
+function showSendFailure(err) {
+  toast(err.uncertain ? err.message : '发送失败：' + err.message);
 }
 
 function esc(s) {
@@ -58,8 +76,7 @@ function esc(s) {
     .replace(/"/g, '&quot;').replace(/\r/g, '').replace(/\n/g, ' ');
 }
 
-function toast(msg, sub, opts) {
-  const o = opts || {};
+function toast(msg, sub) {
   let t = document.querySelector('.toast');
   if (!t) {
     t = document.createElement('div');
@@ -67,7 +84,6 @@ function toast(msg, sub, opts) {
     document.body.appendChild(t);
   }
   t.replaceChildren();
-  t.classList.toggle('is-clickable', !!o.onClick);
   const line = document.createElement('span');
   line.textContent = msg;
   t.appendChild(line);
@@ -77,22 +93,9 @@ function toast(msg, sub, opts) {
     hint.textContent = sub;
     t.appendChild(hint);
   }
-  if (o.onClick) {
-    const go = document.createElement('small');
-    go.className = 'toast-go';
-    go.textContent = o.action || '查看 ›';
-    t.appendChild(go);
-    t.onclick = () => {
-      t.classList.remove('show');
-      clearTimeout(t._timer);
-      o.onClick();
-    };
-  } else {
-    t.onclick = null;
-  }
   t.classList.add('show');
   clearTimeout(t._timer);
-  t._timer = setTimeout(() => t.classList.remove('show'), o.hold || (o.onClick ? 9000 : 2600));
+  t._timer = setTimeout(() => t.classList.remove('show'), 2600);
 }
 
 function showSyncErrors(errors) {
@@ -741,52 +744,32 @@ let _eventLastId = 0;
 let _eventReconnectTimer = null;
 let _eventOk = false;
 let _badgeRefreshTimer = null;
+let _badgeRefreshVersion = 0;
 
 function handleNewMailNotice(n) {
   playNoticeSound();
-  const label = n.email ? `${n.email} 收到 ${n.count} 封新邮件` : `收到 ${n.count} 封新邮件`;
-  const accId = n.acc_id != null ? Number(n.acc_id) : (n.acc != null ? Number(n.acc) : 0);
-  const uid = (n.uids && n.uids.length) ? String(n.uids[0]) : '';
-  const onClick = (accId && uid) ? () => openMailFromNotice(accId, uid) : null;
-  toast(label, onClick ? '点提示直接打开这封邮件' : '', {
-    onClick,
-    action: '查看 ›',
-    hold: 9000,
-  });
   // 触发 Windows 任务栏图标闪烁
   if (window.pumailAPI && window.pumailAPI.flashTaskbar) {
     window.pumailAPI.flashTaskbar();
   }
-}
-
-async function openMailFromNotice(accId, uid) {
-  try {
-    if (state.acc !== accId) {
-      await switchAccount(accId);
-    } else if (state.folder !== 'INBOX') {
-      switchFolder('INBOX');
-    }
-    await fetchFolderMails({ background: true, merge: true });
-    const row = document.querySelector(`#mailList .mail-row[data-uid="${CSS.escape(String(uid))}"]`);
-    if (row) {
-      row.scrollIntoView({ block: 'nearest' });
-      openThread(row.dataset.uid, row.dataset.uids, row.dataset.key, row.dataset.refs, row);
-    } else {
-      // 列表里还没渲染出来：直接按 uid 打开
-      openThread(String(uid), String(uid), '', '', null);
-    }
-  } catch (err) {
-    toast('打开邮件失败：' + (err.message || err));
-  }
+  // 通知可能晚于已读操作到达，按当前未读状态复核提醒。
+  scheduleBadgeRefresh();
 }
 
 function scheduleBadgeRefresh() {
+  _badgeRefreshVersion += 1;
   if (_badgeRefreshTimer) return;
   _badgeRefreshTimer = setTimeout(async () => {
     _badgeRefreshTimer = null;
+    const refreshVersion = _badgeRefreshVersion;
     try {
       const pack = await api('/api/unread');
       applyUnreadSummary((isGaia() ? pack.recent : pack.all) || pack.all);
+      // 总览只显示最近十天；停止系统提醒必须以全部账号的完整汇总为准。
+      if (refreshVersion === _badgeRefreshVersion && pack.all && pack.all.inbox === 0
+          && window.pumailAPI && window.pumailAPI.clearTaskbarFlash) {
+        await window.pumailAPI.clearTaskbarFlash();
+      }
     } catch (err) {
       // 下次事件再补
     }
@@ -1327,7 +1310,7 @@ async function loadSyncStatus() {
       return;
     }
     const netLine = d.proxy_active
-      ? `<p class="settings-note muted">网络：已自动通过系统代理 ${esc(d.proxy || '')} 收发邮件</p>`
+      ? `<p class="settings-note muted">网络：检测到代理配置 ${esc(d.proxy || '')}；实际连接结果见各账号状态</p>`
       : '<p class="settings-note muted">网络：直连（没有检测到系统代理）</p>';
     box.innerHTML = netLine + accounts.map((a) => {
       const modeText = a.mode === 'idle' ? '实时待机'
@@ -2414,6 +2397,11 @@ function bindRow(row) {
   const box = row.querySelector('input[type="checkbox"]');
   row.onclick = (e) => {
     if (e.target.closest('.mail-check')) return;
+    // 已进入多选时，点邮件行即可追加勾选，同时继续阅读正文。
+    if (state.selected.size > 0 && !state.selected.has(key)) {
+      box.checked = true;
+      box.onchange();
+    }
     openThread(row.dataset.uid, row.dataset.uids, key, row.dataset.refs, row);
   };
   row.oncontextmenu = (e) => {
@@ -2517,28 +2505,6 @@ function setRowActive(uid) {
   $('mailList').querySelectorAll('.mail-row').forEach((row) => {
     row.classList.toggle('active', row.dataset.uid === String(uid));
   });
-}
-
-function anyOverlayOpen() {
-  const ids = ['overlay', 'settingsOverlay', 'accountOverlay', 'sendAccOverlay', 'leaveOverlay',
-               'confirmOverlay', 'vaultSetupOverlay', 'vaultUnlockOverlay', 'vaultListOverlay',
-               'ctxMenu', 'replyComposer'];
-  return ids.some((id) => {
-    const el = $(id);
-    return el && !el.hidden;
-  });
-}
-
-function moveSelection(delta) {
-  const rows = [...document.querySelectorAll('#mailList .mail-row')]
-    .filter((row) => !row.classList.contains('is-skel'));
-  if (!rows.length) return;
-  const current = rows.findIndex((row) => row.classList.contains('active'));
-  const next = current === -1 ? (delta > 0 ? 0 : rows.length - 1) : current + delta;
-  if (next < 0 || next >= rows.length) return;
-  const row = rows[next];
-  row.scrollIntoView({ block: 'nearest' });
-  openThread(row.dataset.uid, row.dataset.uids, row.dataset.key, row.dataset.refs, row);
 }
 
 function updateBatchBar() {
@@ -2742,6 +2708,9 @@ function openThread(uid, uidsCsv, key, refsCsv, row) {
         $('threadView').innerHTML = '<p class="thread-loading">正文暂时无法加载</p>';
         toast('打开失败：' + err.message);
       }
+    } finally {
+      // 后端已记录已读状态，不依赖 SSE 通知或从托盘进入窗口。
+      scheduleBadgeRefresh();
     }
   })();
 }
@@ -2885,7 +2854,7 @@ function restoreBody(el) {
   const isHtml = el.dataset.isHtml === '1';
   el.classList.toggle('is-html', isHtml);
   if (isHtml) mountMailHtml(el, el.dataset.origHtml || '');
-  else el.textContent = el.dataset.origText || '';
+  else fillPlainBody(el, el.dataset.origText || '');
 }
 
 function bodyTextNodes(el) {
@@ -2893,7 +2862,7 @@ function bodyTextNodes(el) {
     acceptNode(node) {
       if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
       const parent = node.parentElement;
-      if (parent && parent.closest('script, style')) return NodeFilter.FILTER_REJECT;
+      if (parent && parent.closest('script, style, a')) return NodeFilter.FILTER_REJECT;
       return NodeFilter.FILTER_ACCEPT;
     },
   });
@@ -3052,12 +3021,182 @@ function bindTrSwitch() {
   });
 }
 
+/* ---------- 附件下载 ----------
+   附件不是普通外链：它必须带着本机会话 cookie 回自己的后端取字节，再存成文件。
+   以前附件链接被下面的外链守卫一起拦下、交给系统浏览器打开，而浏览器里没有
+   应用的会话 cookie，/api/attachment 只会返回 401，所以点了没有文件落地。 */
+function isAttachmentLink(node) {
+  return !!(node && node.closest && node.closest('.atts'));
+}
+
+function attachmentFileName(raw) {
+  let name = String(raw == null ? '' : raw).trim();
+  name = name.replace(/[\\/:*?"<>|\r\n\t]/g, '_').replace(/^\.+/, '').trim();
+  return name || 'attachment';
+}
+
+function fileNameFromDisposition(value) {
+  const text = String(value || '');
+  if (!text) return '';
+  const extended = /filename\*\s*=\s*([^;]+)/i.exec(text);
+  if (extended) {
+    let raw = extended[1].trim().replace(/^"|"$/g, '');
+    const m = /^[^']*'[^']*'(.*)$/.exec(raw);
+    if (m) raw = m[1];
+    try {
+      return decodeURIComponent(raw);
+    } catch (err) {
+      return raw;
+    }
+  }
+  const plain = /filename\s*=\s*(?:"([^"]*)"|([^;\s]+))/i.exec(text);
+  if (plain) return plain[1] != null ? plain[1] : plain[2];
+  return '';
+}
+
+function saveAttachmentBlob(blob, name) {
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = objectUrl;
+  link.download = name;
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+}
+
+async function downloadAttachment(link) {
+  const href = (link.getAttribute && link.getAttribute('href')) || link.href || '';
+  if (!href || link.dataset.downloading === '1') return;
+  const name = attachmentFileName(link.dataset.attName || 'attachment');
+  const original = link.textContent;
+  link.dataset.downloading = '1';
+  link.classList.add('is-downloading');
+  link.textContent = '⏳ 正在下载 ' + name;
+  try {
+    // credentials 必须带上：/api/* 用本机会话 cookie 授权，少了就是 401
+    const res = await fetch(href, { credentials: 'same-origin' });
+    if (!res.ok) {
+      let message = '请求失败 ' + res.status;
+      try {
+        const data = await res.json();
+        if (data && data.error) message = data.error;
+      } catch (err) {
+        /* 不是 JSON：保留状态码提示 */
+      }
+      throw new Error(message);
+    }
+    const blob = await res.blob();
+    if (!blob || !blob.size) throw new Error('附件内容为空');
+    const header = res.headers && res.headers.get ? res.headers.get('Content-Disposition') : '';
+    const saved = attachmentFileName(fileNameFromDisposition(header) || name);
+    saveAttachmentBlob(blob, saved);
+    toast('附件已开始下载', saved);
+  } catch (err) {
+    const reason = err && err.name === 'TypeError' ? '本地服务未连接，请重试' : ((err && err.message) || String(err));
+    toast('附件下载失败：' + reason);
+  } finally {
+    link.dataset.downloading = '';
+    link.classList.remove('is-downloading');
+    link.textContent = original;
+  }
+}
+
+/* ---------- 正文里的网址 ----------
+   不少邮件把网址写成纯文本（HTML 里也没有 <a>），在应用里点不动。
+   这里把 http/https 网址识别成可点击链接，点击后统一交给系统默认浏览器打开。 */
+const MAIL_URL_RE = /https?:\/\/[^\s<>"'`，。；：！？、（）【】《》「」“”‘’]+/gi;
+
+function trimUrlEnd(url) {
+  let out = String(url || '');
+  const pairs = { ')': '(', ']': '[', '}': '{', '）': '（', '】': '【', '》': '《', '」': '「' };
+  while (out) {
+    const last = out.slice(-1);
+    if (/[.,;:!?'"’，。；：！？、]/.test(last)) {
+      out = out.slice(0, -1);
+      continue;
+    }
+    const open = pairs[last];
+    if (open) {
+      const opens = out.split(open).length - 1;
+      const closes = out.split(last).length - 1;
+      if (closes > opens) {
+        out = out.slice(0, -1);
+        continue;
+      }
+    }
+    break;
+  }
+  return out;
+}
+
+function linkifyTextInto(container, text) {
+  const raw = String(text == null ? '' : text);
+  let last = 0;
+  let count = 0;
+  let m;
+  MAIL_URL_RE.lastIndex = 0;
+  while ((m = MAIL_URL_RE.exec(raw))) {
+    const matched = m[0];
+    const url = trimUrlEnd(matched);
+    if (!url) continue;
+    if (m.index > last) container.appendChild(document.createTextNode(raw.slice(last, m.index)));
+    const link = document.createElement('a');
+    link.href = url;
+    link.textContent = url;
+    link.className = 'mail-link';
+    link.title = '在默认浏览器中打开';
+    link.setAttribute('target', '_blank');
+    link.setAttribute('rel', 'noopener noreferrer');
+    container.appendChild(link);
+    count += 1;
+    last = m.index + matched.length;
+    const trailing = matched.slice(url.length);
+    if (trailing) container.appendChild(document.createTextNode(trailing));
+  }
+  if (last < raw.length) container.appendChild(document.createTextNode(raw.slice(last)));
+  return count;
+}
+
+function linkifyMailHtml(root) {
+  if (!root || !root.childNodes) return 0;
+  let count = 0;
+  const walk = (parent) => {
+    Array.from(parent.childNodes).forEach((node) => {
+      if (!node || !node.nodeType) return;
+      if (node.nodeType === 3) {
+        const text = node.nodeValue || '';
+        if (!/https?:\/\//i.test(text)) return;
+        const holder = node.parentElement;
+        if (holder && holder.closest && holder.closest('a, script, style, textarea')) return;
+        const frag = document.createDocumentFragment();
+        count += linkifyTextInto(frag, text);
+        if (node.parentNode) node.parentNode.replaceChild(frag, node);
+      } else if (node.nodeType === 1) {
+        const tag = String(node.tagName || '').toUpperCase();
+        if (tag === 'A' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'TEXTAREA') return;
+        walk(node);
+      }
+    });
+  };
+  walk(root);
+  return count;
+}
+
+function fillPlainBody(el, text) {
+  const frag = document.createDocumentFragment();
+  linkifyTextInto(frag, text);
+  el.replaceChildren(frag);
+}
+
 function hardenMailLinks(root) {
   const box = root || $('readingPane');
   if (!box) return;
   const scope = box.querySelectorAll ? box : null;
   const links = scope ? box.querySelectorAll('a[href], area[href]') : [];
   links.forEach((a) => {
+    if (isAttachmentLink(a)) return;   // 附件留在应用内下载，不按外链打开
     const href = (a.getAttribute('href') || '').trim();
     if (!href || href.startsWith('#') || href.toLowerCase().startsWith('javascript:')) return;
     a.setAttribute('target', '_blank');
@@ -3074,6 +3213,13 @@ function bindMailLinkGuard() {
     const a = path.find((n) => n && (n.tagName === 'A' || n.tagName === 'AREA'))
       || (e.target.closest && e.target.closest('a[href], area[href]'));
     if (!a || !a.getAttribute) return;
+    if (isAttachmentLink(a)) {
+      // 附件走应用内下载：保持会话 cookie，不要交给系统浏览器
+      e.preventDefault();
+      e.stopPropagation();
+      downloadAttachment(a);
+      return;
+    }
     const href = (a.getAttribute('href') || '').trim();
     if (!href || href.startsWith('#') || href.toLowerCase().startsWith('javascript:')) {
       e.preventDefault();
@@ -3097,7 +3243,7 @@ function bindExternalLinks() {
   document.body.dataset.extLinkGuard = '1';
   document.addEventListener('click', (e) => {
     const a = e.target.closest && e.target.closest('a[target="_blank"]');
-    if (!a || !a.href) return;
+    if (!a || !a.href || isAttachmentLink(a)) return;
     const href = (a.getAttribute('href') || '').trim();
     if (!href || href.startsWith('#') || href.toLowerCase().startsWith('javascript:')) return;
     e.preventDefault();
@@ -3156,6 +3302,12 @@ const MAIL_SHADOW_CSS = `
   height: 1px !important;
 }
 .mail-root a[href] { cursor: pointer; }
+.mail-root a.mail-link {
+  color: #1a73e8;
+  text-decoration: underline;
+  word-break: break-all;
+  cursor: pointer;
+}
 `;
 
 function htmlLooksPlain(html) {
@@ -3183,6 +3335,7 @@ function mountMailHtml(host, html) {
   host.classList.toggle('is-light', currentTheme() === 'light');
   const shadow = host.shadowRoot || host.attachShadow({ mode: 'open' });
   shadow.innerHTML = `<style>${MAIL_SHADOW_CSS}</style><div class="mail-root">${html || ''}</div>`;
+  linkifyMailHtml(shadow.querySelector('.mail-root'));
   hardenMailLinks(shadow);
 }
 
@@ -3259,7 +3412,7 @@ function appendThreadMessage(m, box) {
       body.classList.add('thread-msg-missing');
       body.textContent = '正文暂时没取到（网络或邮箱服务器超时）。这封已经算已读，再点一次这封邮件就会重新加载。';
     } else {
-      body.textContent = m.body || '(无正文)';
+      fillPlainBody(body, m.body || '(无正文)');
     }
     card.appendChild(body);
   }
@@ -3283,6 +3436,11 @@ function appendThreadMessage(m, box) {
       }
       const link = document.createElement('a');
       link.href = '/api/attachment?' + p;
+      link.className = 'att-link';
+      link.dataset.attName = a.name || 'attachment';
+      // download 让浏览器/Electron 按文件处理；万一脚本层没接住，也能直接下载而不是跳到接口页
+      link.download = attachmentFileName(a.name || 'attachment');
+      link.title = '点击下载附件';
       link.textContent = `📎 ${a.name} (${(a.size / 1024).toFixed(1)} KB)`;
       attBox.appendChild(link);
     });
@@ -3508,8 +3666,39 @@ async function composePayload() {
   };
 }
 
+async function sendWithProgress(containerId, buttonId, makePayload) {
+  state.sending = true;
+  const container = $(containerId);
+  const button = $(buttonId);
+  const controls = Array.from(container.querySelectorAll('button, input, textarea, select'));
+  if (!controls.includes(button)) controls.push(button);
+  const disabled = controls.map((el) => el.disabled);
+  const label = button.textContent;
+  const editor = container.querySelector('[contenteditable]');
+  const editable = editor && editor.getAttribute('contenteditable');
+  controls.forEach((el) => { el.disabled = true; });
+  if (editor) editor.setAttribute('contenteditable', 'false');
+  container.setAttribute('aria-busy', 'true');
+  button.textContent = '发送中…';
+  const timer = setTimeout(() => { button.textContent = '仍在发送，请稍候…'; }, 15000);
+  try {
+    const payload = await makePayload();
+    const result = await api('/api/send', { method: 'POST', body: payload });
+    if (!result || result.ok !== true) throw sendUnconfirmedError();
+    return result;
+  } finally {
+    clearTimeout(timer);
+    controls.forEach((el, i) => { el.disabled = disabled[i]; });
+    if (editor) editor.setAttribute('contenteditable', editable);
+    container.removeAttribute('aria-busy');
+    button.textContent = label;
+    state.sending = false;
+  }
+}
+
 async function submitCompose(e) {
   e.preventDefault();
+  if (state.sending) return;
   if (!actionAcc()) {
     toast('请先添加邮箱账号');
     openAccountForm();
@@ -3522,13 +3711,19 @@ async function submitCompose(e) {
     toast('请填写收件人');
     return;
   }
+  let sent;
   try {
-    const sent = await api('/api/send', { method: 'POST', body: await composePayload() });
+    sent = await sendWithProgress('composeForm', 'sendComposeBtn', composePayload);
+  } catch (err) {
+    showSendFailure(err);
+    return;
+  }
+  try {
     closeCompose();
-    toast('已发送', sent && sent.simulated ? '这是模拟邮件 🎭' : '');
+    toast('已发送', (sent && sent.warning) || (sent && sent.simulated ? '这是模拟邮件 🎭' : ''));
     refreshAfterSend();
   } catch (err) {
-    toast('发送失败：' + err.message);
+    toast('邮件已发送，界面更新失败，请刷新');
   }
 }
 
@@ -4053,6 +4248,7 @@ function resetReplyBox() {
 }
 
 function reply() {
+  if (state.sending) { toast('邮件正在发送，请稍候'); return; }
   if (!state.current) return;
   refreshReplyPeople(state.current.threadMessages);
   setAddrField('replyToInput', replyDefaultTo());
@@ -4062,9 +4258,7 @@ function reply() {
   renderReplyPeople();
   updateReplyToPlaceholder();
   $('replyComposer').hidden = false;
-  const to = $('replyToInput');
-  if (to) to.focus();
-  else $('replyBody').focus();
+  $('replyBody').focus();
   $('replyComposer').scrollIntoView({ behavior: 'smooth', block: 'end' });
 }
 
@@ -4124,7 +4318,8 @@ function hideReply() {
 }
 
 async function sendInlineReply() {
-  if (!state.current) return;
+  if (state.sending || !state.current) return;
+  const current = state.current;
   const text = $('replyBody').value.trim();
   commitAddrTyping('replyToInput', true);
   commitAddrTyping('replyCcInput', true);
@@ -4138,35 +4333,44 @@ async function sendInlineReply() {
     toast('请先写点回复内容');
     return;
   }
-  if (!actionAcc()) {
+  const accId = current.acc || actionAcc();
+  const account = accountById(accId);
+  if (!account) {
     toast('请先添加邮箱账号');
     return;
   }
-  const subject = /^re\s*:/i.test(state.current.subject)
-    ? state.current.subject
-    : 'Re: ' + state.current.subject;
+  const subject = /^re\s*:/i.test(current.subject)
+    ? current.subject
+    : 'Re: ' + current.subject;
+  const payload = {
+    acc: accId,
+    to,
+    cc: addrFieldValue('replyCcInput').trim(),
+    bcc: addrFieldValue('replyBccInput').trim(),
+    subject,
+    body: text,
+    in_reply_to: current.message_id || '',
+  };
+  let sentRes;
   try {
-    const sentRes = await api('/api/send', {
-      method: 'POST',
-      body: {
-        acc: state.current.acc || actionAcc(),
-        to,
-        cc: addrFieldValue('replyCcInput').trim(),
-        bcc: addrFieldValue('replyBccInput').trim(),
-        subject,
-        body: text,
-        in_reply_to: state.current.message_id || '',
-      },
-    });
+    sentRes = await sendWithProgress('replyComposer', 'sendReplyBtn', () => payload);
+  } catch (err) {
+    showSendFailure(err);
+    return;
+  }
+  toast('已发送', (sentRes && sentRes.warning) || (sentRes && sentRes.simulated ? '这是模拟邮件 🎭' : ''));
+  // 发信期间用户可能切换账号或会话，不能覆盖新会话的正文和输入。
+  if (state.current !== current) { refreshAfterSend(); return; }
+  try {
     const box = $('threadView');
     box.classList.add('is-chat');
     const sent = {
       mine: true,
       subject,
-      from: currentAccEmail(),
-      from_addr: currentAccEmail(),
+      from: account.email,
+      from_addr: account.email,
       to,
-      cc: addrFieldValue('replyCcInput').trim(),
+      cc: payload.cc,
       date: new Date().toISOString(),
       body: text,
     };
@@ -4177,12 +4381,12 @@ async function sendInlineReply() {
     stashThreadBodies();
     if (state.trMode && state.trMode !== 'orig') applyThreadTranslate(state.trMode);
     resetReplyBox();
-    toast('已发送', sentRes && sentRes.simulated ? '这是模拟邮件 🎭' : '');
+    if (sentRes && sentRes.message_id) current.message_id = sentRes.message_id;
     sec.scrollIntoView({ behavior: 'smooth', block: 'end' });
     bumpCurrentRowTime();
     refreshAfterSend();
   } catch (err) {
-    toast('发送失败：' + err.message);
+    toast('邮件已发送，界面更新失败，请刷新');
   }
 }
 
@@ -4757,18 +4961,6 @@ function bindEvents() {
     // 写邮件窗口也不响应 Esc：避免手一抖把草稿丢了（同上，只用 × / 存草稿 / 发送）
     else if (!$('replyComposer').hidden) hideReply();
   });
-  // J / K：上一封 / 下一封（输入框里、弹层打开时不响应）
-  document.addEventListener('keydown', (e) => {
-    if (e.key !== 'j' && e.key !== 'k') return;
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
-    const t = e.target;
-    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
-    if (anyOverlayOpen()) return;
-    e.preventDefault();
-    moveSelection(e.key === 'j' ? 1 : -1);
-  });
-  if ($('prevMailBtn')) $('prevMailBtn').onclick = () => moveSelection(-1);
-  if ($('nextMailBtn')) $('nextMailBtn').onclick = () => moveSelection(1);
   bindSplitter();
   bindTrSwitch();
   bindMailLinkGuard();

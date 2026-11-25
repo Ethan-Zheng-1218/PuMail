@@ -23,6 +23,10 @@ electron/node_modules/
 electron/build/*
 !electron/build/_make_bitmaps.py
 !electron/build/installer.nsh
+!electron/build/installer-bootstrap.cs
+!electron/build/installer-bootstrap.manifest
+!electron/build/bootstrap-installer.ps1
+!electron/build/pack-installer.ps1
 electron/dist/
 
 # ===== 打包产物 =====
@@ -31,6 +35,8 @@ electron/dist/
 *.dmg
 *.AppImage
 PuMail-build/
+release-*/
+.diagnostics/
 pumai历代版本/
 
 # ===== 日志与调试 =====

@@ -1,4 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+import ssl
+
+# Some build runtimes load a companion certificate policy from SSLContext.__new__.
+# Keep that policy alongside the frozen ssl module; do not disable verification.
+tls_policy = Path(ssl.__file__).with_name('codex-rejected-cas.pem')
+tls_data = [(str(tls_policy), '.')] if tls_policy.is_file() else []
 
 
 a = Analysis(
@@ -19,7 +26,7 @@ a = Analysis(
         ('gaia-tree.png', '.'),
         ('notice14.mp3', '.'),
         ('guide-images', 'guide-images'),
-    ],
+    ] + tls_data,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

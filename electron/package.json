@@ -1,12 +1,12 @@
 {
   "name": "pumail",
-  "version": "1.1.5",
+  "version": "1.1.12",
   "private": true,
   "description": "PuMail desktop shell",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "pack": "electron-builder --win nsis",
+    "pack": "powershell -NoProfile -ExecutionPolicy Bypass -File build/pack-installer.ps1",
     "pack:dir": "electron-builder --win dir"
   },
   "devDependencies": {
